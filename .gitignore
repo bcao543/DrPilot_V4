@@ -1,0 +1,42 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 环境变量与本地配置（含 API Key，禁止提交）
+.env
+.env.local
+
+# 运行产物（仅仓库根目录）
+/output*
+/*.jsonl
+/index.json
+/题目_*
+/drpilot_config.json
+/drpilot_adb_config.json
+
+# 界面预览截图（tools/ui_preview.py 生成）
+tools/*.png
+
+# 运行日志（CLI 每次运行都会写；Agent 靠它定位问题）
+/logs/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 演示视频工程（体积大、含第三方音频素材，不入核心仓库）
+/videos/
+
+# 编辑器 / 笔记应用状态
+.obsidian/
+
+# uv 本地缓存（若在仓库内）
+.uv-cache/

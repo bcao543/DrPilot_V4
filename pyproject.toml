@@ -1,0 +1,40 @@
+[project]
+name = "drpilot-v4"
+version = "4.0.0"
+description = "ADB 滑动截图 + AI 题目识别，导出 JSON/Markdown，含命令行与图形界面"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "openai>=3.10.0",
+    "pillow>=12.3.0",
+    "python-dotenv>=1.2.3",
+    "pywebview>=5.0",
+]
+
+[project.scripts]
+drpilot = "drpilot.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+# 只挑「真问题」：未使用导入、导入顺序、未定义名、缺换行、zip 未显式 strict。
+# 不启用 UP 系列：本项目所有文件都保留 # -*- coding: utf-8 -*-（Windows 控制台友好），
+# 那是刻意选择，不是待清理的遗留；E741 同理（测试里的短变量名 l）。
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501", "E741"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drpilot"]

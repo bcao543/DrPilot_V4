@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DrPilot v4 · ADB 题目识别</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>𝘿𝙧𝙋𝙞𝙡𝙤𝙩 <span>𝙑𝟰</span></h1>
+      <p>ADB 截图 · AI 题目识别 · 导出 JSONL / Markdown / index.json</p>
+    </div>
+    <div class="topbar-actions">
+      <div class="pill" id="pill-device"><i class="dot"></i><span id="pill-device-text">设备：检测中…</span></div>
+      <div class="pill" id="pill-model"><i class="dot"></i><span id="pill-model-text">模型：未测试</span></div>
+      <button class="btn ghost" id="btn-exit">退出</button>
+    </div>
+  </header>
+
+  <section class="card toolbar">
+    <button class="btn primary" id="btn-start"><b>▶</b> 开始提取</button>
+    <button class="btn danger" id="btn-stop" disabled><b>■</b> 停止</button>
+    <div class="progress"><div class="bar" id="bar"></div></div>
+    <div class="run-meta">
+      <span class="cur" id="cur">--</span>
+      <span class="status" id="status">就绪</span>
+    </div>
+    <div class="workers" id="worker-chips"></div>
+  </section>
+
+  <!-- 参数区（自适应高度）+ 日志（吸收剩余高度）：两边都不会出现大片空白 -->
+  <div class="workspace">
+    <main class="grid">
+      <div class="col">
+        <section class="card">
+          <div class="card-head">
+            <h2>任务范围</h2><span class="hint">题号以截图右上角为准</span>
+          </div>
+          <div class="rows">
+            <div class="row">
+              <label class="field"><span>题号</span>
+                <input id="page_from" class="w-sm num" placeholder="起始">
+              </label>
+              <span class="tilde">到</span>
+              <input id="page_to" class="w-sm num" placeholder="结束">
+              <span class="badge" id="total-hint">共 — 题</span>
+            </div>
+            <div class="row">
+              <label class="field grow"><span>教材</span><input id="textbook" placeholder="如：诊断学"></label>
+              <label class="field grow"><span>章节</span><input id="chapter" placeholder="如：第三章 胸部检查"></label>
+            </div>
+            <div class="row">
+              <label class="field"><span>章号</span><input id="chapter_no" class="w-xs num" placeholder="自动"></label>
+              <label class="field"><span>本章总题数</span><input id="chapter_total" class="w-sm num" placeholder="自动"></label>
+              <span class="hint">留空则自动识别</span>
+            </div>
+            <div class="row">
+              <label class="field grow"><span>输出</span><input id="output_dir" placeholder="如：D:\\题库"></label>
+              <button class="btn" id="btn-pick-dir">选择…</button>
+            </div>
+            <p class="preview" id="output-preview">请先选择输出文件夹</p>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>手机连接</h2><span class="hint">无线调试，一键 adb connect</span>
+            <span class="spacer"></span>
+            <button class="btn small" id="btn-refresh-devices">刷新设备</button>
+          </div>
+          <div class="rows">
+            <div class="row">
+              <label class="field grow"><span>手机 IP</span><input id="device_ip" placeholder="无线调试里的 IP"></label>
+              <span class="colon">:</span>
+              <input id="device_port" class="w-xs num" placeholder="5555">
+            </div>
+            <div class="row">
+              <button class="btn primary" id="btn-connect"><b>⇄</b> 连接</button>
+              <button class="btn" id="btn-disconnect">断开</button>
+              <span class="hint" id="device-detail">未检测</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="col">
+        <section class="card" id="card-model">
+          <div class="card-head">
+            <h2>模型服务</h2><span class="hint" id="model-note">开始前自动自检</span>
+            <span class="spacer"></span>
+            <button class="btn small" id="btn-test-model">测试连通性</button>
+          </div>
+          <div class="rows">
+            <div class="row">
+              <label class="field grow"><span>模型 ID</span><input id="model" placeholder="平台上的模型 ID"></label>
+              <label class="field grow"><span>API 地址</span><input id="base_url" placeholder="https://api.example.com/v1"></label>
+            </div>
+            <div class="row">
+              <label class="field grow"><span>API Key</span>
+                <span class="secret">
+                  <input id="api_key_input" type="password" autocomplete="new-password"
+                    autocapitalize="off" autocorrect="off" spellcheck="false"
+                    placeholder="粘贴新 Key（可多行 / 逗号分隔），回车即新增">
+                  <button class="btn icon" id="btn-toggle-key" type="button"
+                    title="隐私输入模式：点眼睛临时显示/隐藏你输入的内容"
+                    aria-label="显示或隐藏输入的 API Key"><span id="key-eye">👁</span></button>
+                </span>
+              </label>
+              <button class="btn small primary" id="btn-add-key">＋ 新增 API Key</button>
+            </div>
+            <div class="row keys-line">
+              <span class="hint" id="key-info">正在读取 API Key…</span>
+              <span class="spacer"></span>
+              <button class="btn small ghost hidden" id="btn-clear-keys">全部删除</button>
+            </div>
+            <div class="key-chips" id="key-chips"></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>识别与输出</h2><span class="hint">次要参数</span></div>
+          <div class="rows">
+            <div class="row">
+              <label class="field"><span>批大小</span><input id="batch_size" class="w-xs num" placeholder="3"></label>
+              <label class="field"><span>并发</span><input id="workers" class="w-xs num" placeholder="2"><em class="key-hint" id="workers-hint"></em></label>
+              <label class="field"><span>翻页等待</span><input id="wait_ms" class="w-sm num" placeholder="1000"><em>ms</em></label>
+            </div>
+            <div class="row switches">
+              <label class="switch"><input type="checkbox" id="opt-md" checked><span class="track"><span class="knob"></span></span><span>生成 Markdown</span></label>
+              <label class="switch"><input type="checkbox" id="opt-index" checked><span class="track"><span class="knob"></span></span><span>生成 index.json</span></label>
+            </div>
+            <div class="row switches">
+              <label class="switch"><input type="checkbox" id="opt-preflight" checked><span class="track"><span class="knob"></span></span><span>开始前预检题号</span></label>
+              <label class="switch"><input type="checkbox" id="opt-check-model" checked><span class="track"><span class="knob"></span></span><span>运行前测试模型</span></label>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card collapsible span-2" id="card-swipe">
+        <div class="card-head clickable" id="swipe-head">
+          <h2>翻页动作（点击 / 滑动）</h2><span class="hint">可录制，换机型自动缩放</span>
+          <span class="spacer"></span>
+          <button class="btn small ghost" id="btn-swipe-toggle">展开 ▾</button>
+        </div>
+        <div class="rows hidden" id="swipe-body">
+          <input type="hidden" id="next_action" value="">
+          <div class="row action-bar">
+            <button class="btn small" id="btn-record-start">开始录制</button>
+            <button class="btn small" id="btn-record-stop">停止录制</button>
+            <button class="btn small" id="btn-test-action">试一次</button>
+            <button class="btn small ghost" id="btn-action-clear">清除动作</button>
+            <span class="hint" id="action-status">未设置：将使用下方手动滑动坐标</span>
+          </div>
+          <div class="row"><ol class="action-steps" id="action-steps"></ol></div>
+          <div class="swipe-groups">
+            <div class="swipe-group">
+              <span class="group-label">手动点按（不支持录制时用）</span>
+              <div class="row">
+                <label class="field"><em>X</em><input id="action_tap_x" class="w-xs num" placeholder="X"></label>
+                <label class="field"><em>Y</em><input id="action_tap_y" class="w-xs num" placeholder="Y"></label>
+                <label class="field"><em>按住</em><input id="action_tap_ms" class="w-xs num" placeholder="80"><em>ms</em></label>
+                <button class="btn small" id="btn-use-tap">用这个坐标做点按</button>
+              </div>
+            </div>
+            <div class="swipe-group">
+              <span class="group-label">手动滑动（无录制时使用）</span>
+              <div class="row">
+                <span class="group-label">起点</span>
+                <label class="field"><em>X</em><input id="swipe_x1" class="w-xs num" placeholder="X"></label>
+                <label class="field"><em>Y</em><input id="swipe_y1" class="w-xs num" placeholder="Y"></label>
+                <span class="group-label">终点</span>
+                <label class="field"><em>X</em><input id="swipe_x2" class="w-xs num" placeholder="X"></label>
+                <label class="field"><em>Y</em><input id="swipe_y2" class="w-xs num" placeholder="Y"></label>
+              </div>
+              <div class="row">
+                <label class="field"><span>时长</span><input id="swipe_duration" class="w-xs num" placeholder="150"><em>ms</em></label>
+                <label class="field"><span>重试</span><input id="swipe_retries" class="w-xs num" placeholder="5"></label>
+                <label class="field"><span>等待</span><input id="swipe_retry_wait" class="w-xs num" placeholder="1.2"><em>s</em></label>
+              </div>
+            </div>
+            <div class="swipe-group">
+              <span class="group-label">基准分辨率（换机型时自动缩放坐标）</span>
+              <div class="row">
+                <label class="field grow"><input id="swipe_reference" placeholder="留空 = 首次运行自动记录"></label>
+              </div>
+              <div class="row">
+                <button class="btn small" id="btn-set-reference">设为当前设备</button>
+                <button class="btn small" id="btn-test-swipe">试滑一次</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <section class="card log-card">
+      <div class="card-head">
+        <h2>日志</h2>
+        <span class="spacer"></span>
+        <button class="btn small ghost" id="btn-open-dir">打开输出目录</button>
+        <button class="btn small ghost" id="btn-clear-log">清空</button>
+      </div>
+      <div class="log-wrap">
+        <canvas class="horse" id="horse" aria-hidden="true"></canvas>
+        <div class="log" id="log"></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="overlay" id="overlay">
+    <div class="modal">
+      <h3 id="modal-title">提示</h3>
+      <p id="modal-body"></p>
+      <div class="modal-actions">
+        <button class="btn" id="modal-no">取消</button>
+        <button class="btn primary" id="modal-yes">继续</button>
+      </div>
+    </div>
+  </div>
+  <div class="toasts" id="toasts"></div>
+
+  <script src="horse.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
