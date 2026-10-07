@@ -6,18 +6,23 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
+import copy
+import io
 import json
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from drpilot.actions import RecordResult, Step
+from drpilot import display as display_module
+from drpilot.actions import RecordResult, Step, build_next_action
 from drpilot.adb import DeviceInfo
 from drpilot.ai import ModelCheckResult
-from drpilot.errors import AdbError
+from drpilot.config import AppConfig
+from drpilot.errors import AdbError, ConfigError
 from drpilot.keys import env_file_path
 from drpilot.webui.bridge import (
     UiBridge,
@@ -25,6 +30,7 @@ from drpilot.webui.bridge import (
     config_from_payload,
     log_tone,
 )
+from drpilot.webui.tuner import DisplayTunerApi
 
 
 def wait_until(predicate, timeout=5.0):
@@ -112,6 +118,13 @@ def make_payload(**overrides):
         "action_tap_x": "",
         "action_tap_y": "",
         "action_tap_ms": "80",
+        # 提取模块 / 加长主屏（display_mode / display_scaling 是勾选框状态）
+        "extract_modules": "",
+        "display_scale": "2.0",
+        "display_density": "0",
+        "display_scaling": False,
+        "display_mode": False,
+        "max_tokens": "4096",
     }
     payload.update(overrides)
     return payload
@@ -161,16 +174,55 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(config.next_action[0]["kind"], "tap")
         self.assertEqual((config.next_action[0]["x"], config.next_action[0]["y"]), (10, 20))
 
-    def test_manual_tap_fallback_from_payload(self):
+    def test_manual_tap_coordinates_are_kept_apart_from_recorded_steps(self):
+        """点按坐标单独存 tap_*，不再塞进 next_action（那是录制动作专用）。"""
         config = config_from_payload(
             make_payload(next_action="", action_tap_x="12", action_tap_y="34")
         )
-        self.assertEqual(
-            [step["kind"] for step in config.next_action],
-            ["tap"],
-        )
-        self.assertEqual((config.next_action[0]["x"], config.next_action[0]["y"]), (12, 34))
-        self.assertTrue(config.next_action[0]["absolute"])   # 手动坐标是当前设备像素，不缩放
+        self.assertEqual(config.next_action, [])
+        self.assertEqual((config.tap_x, config.tap_y), (12, 34))
+        self.assertEqual(config.page_action, "auto")
+        # auto 的优先级：没有录制动作时退回手动点按（坐标是当前设备像素，不缩放）
+        steps = build_next_action(config)
+        self.assertEqual([step.kind for step in steps], ["tap"])
+        self.assertEqual((steps[0].x, steps[0].y), (12, 34))
+        self.assertTrue(steps[0].absolute)
+
+    def test_page_action_chooses_one_kind(self):
+        """三选一：选了哪一种就只用它，不再回头看其它参数。"""
+        recorded = json.dumps([{"kind": "swipe", "x": 9, "y": 9, "x2": 1, "y2": 1, "duration_ms": 100}])
+        base = dict(next_action=recorded, action_tap_x="12", action_tap_y="34")
+
+        config = config_from_payload(make_payload(**base, page_action="swipe"))
+        self.assertEqual(config.page_action, "swipe")
+        self.assertEqual([step.kind for step in build_next_action(config)], ["swipe"])
+
+        config = config_from_payload(make_payload(**base, page_action="tap"))
+        steps = build_next_action(config)
+        self.assertEqual([step.kind for step in steps], ["tap"])
+        self.assertEqual((steps[0].x, steps[0].y), (12, 34))
+
+        config = config_from_payload(make_payload(**base, page_action="record"))
+        steps = build_next_action(config)
+        self.assertEqual([step.kind for step in steps], ["swipe"])
+        self.assertEqual((steps[0].x, steps[0].y), (9, 9))
+
+        # 选了点按却没填坐标：退回固定滑动，至少不会原地卡死
+        config = config_from_payload(make_payload(page_action="tap", action_tap_x="", action_tap_y=""))
+        self.assertEqual([step.kind for step in build_next_action(config)], ["swipe"])
+
+    def test_output_fields_from_payload(self):
+        """本体字段开关：JSON 字符串 / 缺席都用默认三件套，空数组 = 都不要。"""
+        default = config_from_payload(make_payload())
+        self.assertEqual([item["key"] for item in default.output_fields], ["id", "stem", "answer"])
+
+        text = json.dumps([{"key": "answer", "in_json": True, "in_markdown": False}])
+        config = config_from_payload(make_payload(output_fields=text))
+        self.assertEqual([item["key"] for item in config.output_fields], ["answer"])
+        self.assertFalse(config.output_fields[0]["in_markdown"])
+
+        empty = config_from_payload(make_payload(output_fields="[]"))
+        self.assertEqual(empty.output_fields, [])
 
     def test_config_dict_emits_next_action(self):
         bridge = UiBridge(adb_factory=FakeAdb)
@@ -464,17 +516,19 @@ class BridgeActionTests(unittest.TestCase):
         self.assertTrue(self.bridge._state["recording"])
 
     def test_clear_action_and_manual_tap(self):
+        self.bridge._config.next_action = [{"kind": "tap", "x": 1, "y": 2, "duration_ms": 0}]
         self.bridge.clear_action()
         self.assertEqual(self.bridge._state["action"]["steps"], [])
         result = self.bridge.use_tap(
             make_payload(next_action="", action_tap_x="12", action_tap_y="34")
         )
         self.assertTrue(result["ok"])
-        steps = self.bridge._state["action"]["steps"]
-        self.assertEqual((steps[0]["x"], steps[0]["y"]), (12, 34))
-        self.assertTrue(steps[0]["absolute"])
+        # 手动点按存进 tap_*，翻页方式切成「点按」；录制动作（next_action）不受影响
         patch = self.bridge.poll()["state"]["form_patch"]
-        self.assertIn("next_action", patch)
+        self.assertEqual(patch.get("page_action"), "tap")
+        self.assertEqual((patch.get("action_tap_x"), patch.get("action_tap_y")), (12, 34))
+        self.assertEqual(self.bridge.action_state()["kind"], "tap")
+        self.assertIn("12", self.bridge.action_summary())
 
     def test_use_tap_requires_coordinates(self):
         result = self.bridge.use_tap(make_payload(next_action=""))
@@ -496,6 +550,46 @@ class BridgeActionTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+class GuiEntryTests(unittest.TestCase):
+    """cli → webui.run_web_ui → app.run_web_ui 这条转发链的参数必须对得上。
+
+    真实事故：webui/__init__.py 只转发 config_path，cli 一传 logger 就
+    「run_web_ui() got an unexpected keyword argument 'logger'」，界面起不来。
+    """
+
+    def test_gui_entry_forwards_arguments_to_app(self):
+        from drpilot import webui
+        from drpilot.webui import app as app_module
+
+        seen: dict[str, object] = {}
+
+        def fake(config_path=None, width=1180, height=920, logger=None):
+            seen.update(config_path=config_path, width=width, height=height, logger=logger)
+            return 0
+
+        original = app_module.run_web_ui
+        app_module.run_web_ui = fake          # webui 里是调用时 import，替换有效
+        try:
+            code = webui.run_web_ui(config_path="cfg.json", logger="LOGGER")
+        finally:
+            app_module.run_web_ui = original
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["config_path"], "cfg.json")
+        self.assertEqual(seen["logger"], "LOGGER")
+
+    def test_signatures_match(self):
+        import inspect
+
+        from drpilot import webui
+        from drpilot.webui import app as app_module
+
+        entry = set(inspect.signature(webui.run_web_ui).parameters)
+        real = set(inspect.signature(app_module.run_web_ui).parameters)
+        self.assertTrue(
+            real <= entry, f"webui.run_web_ui 少转发参数：{sorted(real - entry)}"
+        )
+
+
 class FrontendContractTests(unittest.TestCase):
     """前端 app.js 依赖的字段与方法，必须真的存在（防止改名后前端悄悄失效）。"""
 
@@ -503,7 +597,7 @@ class FrontendContractTests(unittest.TestCase):
         "device", "model", "keys", "key_masked", "key_count", "key_items",
         "progress", "running", "stopping", "model_checking",
         "workers", "question", "toasts", "form_patch", "total_hint", "output_preview",
-        "recording", "action",
+        "recording", "action", "display", "modules",
     ]
     FRONTEND_API = [
         "ready", "poll", "preview", "start", "stop", "test_model",
@@ -512,6 +606,9 @@ class FrontendContractTests(unittest.TestCase):
         "start_record", "stop_record", "test_action", "clear_action", "use_tap",
         "answer_question", "exit",
         "save_keys", "reveal_keys", "clear_keys", "add_keys", "delete_key",
+        "list_module_presets", "display_status", "reset_display", "preview_capture",
+        # 实时滑块：应用显示设置、取一次缩略图、点缩略图看全尺寸
+        "apply_display", "pop_display_thumb", "open_display_capture",
     ]
 
     def test_state_shape(self):
@@ -527,6 +624,29 @@ class FrontendContractTests(unittest.TestCase):
             self.assertIn(key, state["progress"], key)
         for key in ("recording", "steps", "summary", "reference", "note"):
             self.assertIn(key, state["action"], key)
+        for key in ("text", "tone", "detail", "thumb_seq"):
+            self.assertIn(key, state["display"], key)
+        self.assertIsInstance(state["modules"], list)
+
+    def test_gui_log_is_mirrored_to_the_run_logger(self):
+        """图形界面的日志要同时进 logs/drpilot-*.log，否则关掉窗口就丢了。"""
+        seen: list[tuple[str, str]] = []
+
+        class Recorder:
+            def log(self, message, level="INFO", **_kwargs):
+                seen.append((str(level), str(message)))
+
+        bridge = UiBridge(adb_factory=FakeAdb, run_logger=Recorder())
+        bridge._log("正常一行")
+        bridge._log("出错了", "err")
+        bridge._log("小心点", "warn")
+        self.assertEqual(seen[0], ("INFO", "正常一行"))
+        self.assertEqual(seen[1][0], "ERROR")
+        self.assertEqual(seen[2][0], "WARN")
+
+    def test_gui_runs_without_a_run_logger(self):
+        bridge = UiBridge(adb_factory=FakeAdb)
+        bridge._log("没有日志文件时也不能炸")
 
     def test_api_methods_exist(self):
         bridge = UiBridge(adb_factory=FakeAdb)
@@ -545,6 +665,857 @@ class FrontendContractTests(unittest.TestCase):
         payload = bridge.poll()
         json.dumps(payload, ensure_ascii=False)  # pywebview 就是这么传的
 
+
+
+class FakeDisplayAdb:
+    """模拟一台支持 wm size / density / scaling 的手机。
+
+    真机行为照抄 tests/test_display.py：超过 max_height 的尺寸被静默忽略、
+    覆盖值要回读才有、截图要等画面稳定。状态放类属性上：桥每次都 new 一个客户端，
+    测试要能看到「同一台手机」的前后变化。
+    """
+
+    physical = (1260, 2720)
+    density = 520
+    max_height = 5440
+    override: tuple[int, int] | None = None
+    density_override: int | None = None
+    scaling_off = False
+    calls: list[tuple] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.override = None
+        cls.density_override = None
+        cls.scaling_off = False
+        cls.calls = []
+
+    def __init__(self, adb_path=None, serial=None, timeout=30.0, log=None):
+        self.adb_path = adb_path or "/fake/adb"
+        self.serial = serial
+        self.timeout = timeout
+        self.shots = 0
+
+    # ---- DisplayController 用到的命令 ----
+    def run(self, args, check=True, **kwargs):
+        FakeDisplayAdb.calls.append(tuple(args))
+        key = tuple(args)
+        if key == ("shell", "wm", "size"):
+            lines = [f"Physical size: {self.physical[0]}x{self.physical[1]}"]
+            if FakeDisplayAdb.override:
+                lines.append(
+                    f"Override size: {FakeDisplayAdb.override[0]}x{FakeDisplayAdb.override[1]}"
+                )
+            return "\n".join(lines)
+        if key == ("shell", "wm", "density"):
+            lines = [f"Physical density: {self.density}"]
+            if FakeDisplayAdb.density_override:
+                lines.append(f"Override density: {FakeDisplayAdb.density_override}")
+            return "\n".join(lines)
+        if key == ("shell", "dumpsys", "window", "displays"):
+            return "noscale" if FakeDisplayAdb.scaling_off else "init=1260x2720 520dpi"
+        return ""
+
+    def set_wm_size(self, width, height):
+        FakeDisplayAdb.calls.append(("set_wm_size", int(width), int(height)))
+        if int(height) <= self.max_height:
+            FakeDisplayAdb.override = (int(width), int(height))
+
+    def reset_wm_size(self):
+        FakeDisplayAdb.calls.append(("reset_wm_size",))
+        FakeDisplayAdb.override = None
+
+    def set_wm_density(self, density):
+        FakeDisplayAdb.density_override = int(density)
+
+    def reset_wm_density(self):
+        FakeDisplayAdb.density_override = None
+
+    def set_wm_scaling(self, mode):
+        FakeDisplayAdb.scaling_off = str(mode) == "off"
+
+    # ---- 连接与截图 ----
+    def connect(self, address, timeout=None):
+        return f"already connected to {address}"
+
+    def ensure_device(self):
+        return DeviceInfo(serial="USB123", state="device")
+
+    def wm_size(self):
+        return self.physical
+
+    def screenshot(self):
+        self.shots += 1
+        stage = 0 if self.shots < 3 else 1     # 前两张模拟 relayout，之后稳定
+        return b"\x89PNG\r\n\x1a\nWIDE-" + str(stage).encode("ascii")
+
+
+_PNG_CACHE: dict[tuple[int, int], bytes] = {}
+
+
+def png_bytes(width: int = 1260, height: int = 2720) -> bytes:
+    """真的 PNG：实时缩略图那条路要能解码（现生成一张 680 万像素的图太慢，缓存一份）。"""
+    key = (int(width), int(height))
+    if key not in _PNG_CACHE:
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", key, (248, 248, 248)).save(buffer, format="PNG")
+        _PNG_CACHE[key] = buffer.getvalue()
+    return _PNG_CACHE[key]
+
+
+class PngScreenshotAdb(FakeDisplayAdb):
+    """截图返回一张真 PNG，尺寸跟着当前覆盖走（和真机一致）。"""
+
+    def screenshot(self) -> bytes:
+        width, height = FakeDisplayAdb.override or self.physical
+        return png_bytes(width, height)
+
+
+class FakeWindowEvent:
+    """冒充 pywebview 的 window.events.closed（支持 += 注册）。"""
+
+    def __init__(self) -> None:
+        self._handlers: list = []
+
+    def __iadd__(self, handler):
+        self._handlers.append(handler)
+        return self
+
+    def fire(self) -> None:
+        for handler in list(self._handlers):
+            handler()
+
+
+class FakeWindow:
+    """冒充 pywebview 的子窗口：只记「开出来 / 关掉 / 拉到前面」。"""
+
+    def __init__(self, title, page, api, width, height) -> None:
+        self.title = title
+        self.page = page
+        self.api = api
+        self.width = width
+        self.height = height
+        self.events = SimpleNamespace(closed=FakeWindowEvent())
+        self.destroyed = False
+        self.restored = False
+        self.shown = False
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+    def restore(self) -> None:
+        self.restored = True
+
+    def show(self) -> None:
+        self.shown = True
+
+
+class FakeHolder:
+    """冒充 DisplayController：只记「restore 有没有被调到」。"""
+
+    def __init__(self, device=None) -> None:
+        self.device = device
+        self.restored = False
+
+    def restore(self) -> bool:
+        self.restored = True
+        if self.device is not None:
+            self.device.override = None
+        return True
+
+
+class BridgeModulesDisplayTests(unittest.TestCase):
+    """提取模块 + 加长主屏：payload 解析、回填、状态与三个新桥方法。"""
+
+    MODULES_JSON = json.dumps(
+        [
+            {
+                "name": "考点还原",
+                "aliases": ["考点"],
+                "below_fold": True,
+                "required": False,
+                "in_markdown": True,
+                "hint": "",
+            },
+            {"name": "难度", "below_fold": False, "in_markdown": False},
+        ],
+        ensure_ascii=False,
+    )
+
+    def setUp(self):
+        FakeDisplayAdb.reset()
+        # 真机上要等 ~3s 画面稳定，单测里把下限调成 0，避免每次跑测试都睡觉
+        self._min_settle = display_module.MIN_SETTLE_SECONDS
+        display_module.MIN_SETTLE_SECONDS = 0.0
+        self.addCleanup(self._restore_settle)
+        self.bridge = UiBridge(
+            config_path="/tmp/drpilot_bridge_modules.json",
+            adb_factory=FakeDisplayAdb,
+        )
+
+    def _restore_settle(self):
+        display_module.MIN_SETTLE_SECONDS = self._min_settle
+
+    def _state(self):
+        """直接读状态：poll() 会把日志和 toast 排空，测试后面还要看它们。"""
+        with self.bridge._lock:
+            return copy.deepcopy(self.bridge._state)
+
+    # ---- payload / 回填 ----
+    def test_payload_parses_modules_and_display(self):
+        config = config_from_payload(
+            make_payload(
+                extract_modules=self.MODULES_JSON,
+                display_mode=True,
+                display_scaling=True,
+                display_scale="2.5",
+                display_density="420",
+                max_tokens="8192",
+            )
+        )
+        self.assertEqual([item["name"] for item in config.modules], ["考点还原", "难度"])
+        self.assertTrue(config.modules[0]["below_fold"])
+        self.assertEqual(config.modules[0]["aliases"][0], "考点")
+        self.assertFalse(config.modules[1]["below_fold"])
+        self.assertFalse(config.modules[1]["in_markdown"])
+        self.assertEqual(config.display_mode, "wide")
+        self.assertEqual(config.display_scaling, "off")
+        self.assertAlmostEqual(config.display_scale, 2.5)
+        self.assertEqual(config.display_density, 420)
+        self.assertEqual(config.max_tokens, 8192)
+
+    def test_payload_defaults_modules_and_display(self):
+        config = config_from_payload(make_payload())
+        self.assertEqual(config.modules, [])
+        self.assertEqual(config.display_mode, "off")
+        self.assertEqual(config.display_scaling, "auto")
+        self.assertAlmostEqual(config.display_scale, 2.0)
+        self.assertEqual(config.display_density, 0)
+        self.assertEqual(config.max_tokens, 4096)
+
+    def test_payload_without_modules_keeps_field_usable(self):
+        # 逗号清单也认（兼容手写），不是只有 JSON 字符串能过
+        config = config_from_payload(make_payload(extract_modules="考点还原,标准解析"))
+        self.assertEqual([item["name"] for item in config.modules], ["考点还原", "标准解析"])
+
+    def test_payload_rejects_bad_modules(self):
+        with self.assertRaises(ConfigError):
+            config_from_payload(make_payload(extract_modules='[{"name": "stem"}]'))
+        with self.assertRaises(ConfigError):
+            config_from_payload(make_payload(extract_modules='[{"name": "标准解析"}, {"name": "解析"}]'))
+        with self.assertRaises(ConfigError):
+            config_from_payload(make_payload(extract_modules="[{名字]"))
+        with self.assertRaises(ConfigError):
+            config_from_payload(make_payload(max_tokens="很多"))
+
+    def test_config_dict_fills_back_six_fields(self):
+        self.bridge._config = config_from_payload(
+            make_payload(extract_modules=self.MODULES_JSON, display_mode=True, display_scaling=True)
+        )
+        fields = self.bridge._config_dict()
+        # 勾选框回填布尔（app.js 的 FLAGS 直接写 .checked），模块回填 JSON 字符串
+        self.assertIs(fields["display_mode"], True)
+        self.assertIs(fields["display_scaling"], True)
+        self.assertEqual(json.loads(fields["extract_modules"])[0]["name"], "考点还原")
+        self.assertEqual(fields["display_scale"], 2.0)
+        self.assertEqual(fields["display_density"], 0)
+        self.assertEqual(fields["max_tokens"], 4096)
+        self.assertEqual(fields["next_action"], "")
+
+    def test_config_dict_roundtrip(self):
+        self.bridge._config = config_from_payload(
+            make_payload(extract_modules=self.MODULES_JSON, display_mode=True, display_scaling=True)
+        )
+        fields = self.bridge._config_dict()
+        merged = make_payload()
+        for key in (
+            "extract_modules", "display_mode", "display_scaling",
+            "display_scale", "display_density", "max_tokens",
+        ):
+            merged[key] = fields[key]
+        round_trip = config_from_payload(merged)
+        self.assertEqual(round_trip.display_mode, "wide")
+        self.assertEqual(round_trip.display_scaling, "off")
+        self.assertEqual([item["name"] for item in round_trip.modules], ["考点还原", "难度"])
+
+    # ---- 状态 ----
+    def test_state_exposes_modules_and_display(self):
+        state = self._state()
+        self.assertEqual(state["modules"], [])
+        self.assertIn("显示", state["display"]["text"])
+        self.assertIn("tone", state["display"])
+        json.dumps(state, ensure_ascii=False)
+
+    def test_sync_modules_state_mirrors_config(self):
+        self.bridge._config = config_from_payload(make_payload(extract_modules=self.MODULES_JSON))
+        self.bridge._sync_modules_state()
+        state = self._state()
+        self.assertEqual([item["name"] for item in state["modules"]], ["考点还原", "难度"])
+        self.assertTrue(state["modules"][0]["below_fold"])
+
+    def test_list_module_presets(self):
+        self.bridge._config = config_from_payload(make_payload(extract_modules=self.MODULES_JSON))
+        self.bridge._sync_modules_state()
+        result = self.bridge.list_module_presets()
+        names = [spec["name"] for spec in result["presets"]]
+        self.assertIn("标准解析", names)
+        self.assertIn("考点还原", names)
+        self.assertGreaterEqual(len(names), 5)
+        self.assertIn("aliases", result["presets"][0])
+        self.assertEqual([item["name"] for item in result["current"]], ["考点还原", "难度"])
+        json.dumps(result, ensure_ascii=False)      # 必须能过 pywebview 的 JSON 序列化
+
+    # ---- display_status ----
+    def test_display_status_reads_device(self):
+        immediate = self.bridge.display_status()
+        self.assertTrue(immediate["ok"])
+        self.assertIn("text", immediate)
+        self.assertIn("state", immediate)
+        self.assertTrue(wait_until(lambda: bool(self._state()["display"]["state"])))
+        display = self._state()["display"]
+        self.assertIn("1260x2720", display["text"])
+        self.assertEqual(display["state"]["physical"], "1260x2720")
+        self.assertFalse(display["has_override"])
+        self.assertIn("手机当前显示", "\n".join(line["text"] for line in self.bridge._logs))
+        json.dumps(self.bridge.poll(), ensure_ascii=False)
+
+    def test_display_status_reports_existing_override(self):
+        FakeDisplayAdb.override = (1260, 5440)
+        self.bridge.display_status()
+        self.assertTrue(wait_until(lambda: self._state()["display"]["has_override"]))
+        display = self._state()["display"]
+        self.assertIn("已有覆盖", display["text"])
+        self.assertEqual(display["state"]["override"], "1260x5440")
+        self.assertTrue(self.bridge._state["toasts"])
+
+    def test_display_status_failure_is_soft(self):
+        class BoomAdb(FakeDisplayAdb):
+            def ensure_device(self):
+                raise AdbError("未找到 adb 可执行文件")
+
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_boom.json", adb_factory=BoomAdb)
+        result = bridge.display_status()
+        self.assertTrue(result["ok"])               # 立刻返回缓存值，不抛
+        self.assertTrue(wait_until(lambda: "失败" in bridge._state["display"]["text"]))
+        self.assertTrue(bridge._state["toasts"])
+
+    # ---- reset_display ----
+    def test_reset_display_clears_override(self):
+        FakeDisplayAdb.override = (1260, 5440)
+        FakeDisplayAdb.density_override = 420
+        FakeDisplayAdb.scaling_off = True
+        result = self.bridge.reset_display()
+        self.assertTrue(result["ok"])
+        self.assertIn("text", result)
+        self.assertTrue(wait_until(lambda: "已复位" in self._state()["display"]["text"]))
+        self.assertIsNone(FakeDisplayAdb.override)
+        self.assertIsNone(FakeDisplayAdb.density_override)
+        self.assertFalse(FakeDisplayAdb.scaling_off)
+        self.assertFalse(self._state()["display"]["has_override"])
+
+    def test_reset_display_failure_is_soft(self):
+        class BoomAdb(FakeDisplayAdb):
+            def ensure_device(self):
+                raise AdbError("设备未连接")
+
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_boom.json", adb_factory=BoomAdb)
+        self.assertTrue(bridge.reset_display()["ok"])
+        self.assertTrue(wait_until(lambda: "复位失败" in bridge._state["display"]["text"]))
+        self.assertTrue(bridge._state["toasts"])
+
+    # ---- preview_capture ----
+    def test_apply_display_density_only(self):
+        """倍数 1.0 + 密度 420：不加长，但密度确实改了（以前这条是空转的）。"""
+        self.bridge.apply_display(
+            make_payload(display_mode=True, display_scale="1.0", display_density="420")
+        )
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.density_override == 420))
+        self.assertIsNone(FakeDisplayAdb.override)          # 没有加长
+        self.assertTrue(wait_until(lambda: "密度已改为 420" in self._state()["display"]["text"]))
+        self.bridge.shutdown()
+        self.assertIsNone(FakeDisplayAdb.density_override)
+
+    def test_preview_capture_keeps_the_screen(self):
+        payload = make_payload(
+            display_scale="2.0", display_density="420", display_scaling=True, display_mode=True
+        )
+        with mock.patch.object(UiBridge, "_open_path", return_value=True) as opener:
+            result = self.bridge.preview_capture(payload)
+            self.assertTrue(result["ok"])
+            self.assertTrue(
+                wait_until(
+                    lambda: bool((self._state()["display"].get("capture") or {}).get("image"))
+                )
+            )
+        capture = self._state()["display"]["capture"]
+        self.assertTrue(os.path.isfile(capture["image"]))
+        with open(capture["image"], "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"\x89PNG"))
+        self.assertEqual(capture["size"], "1260x5440")
+        self.assertTrue(capture["display"]["verified"])
+        self.assertTrue(capture["opened"])
+        opener.assert_called_once_with(capture["image"])
+        # 抓图不动屏幕：设置留着给用户继续调，复位交给「复位显示」/退出
+        self.assertEqual(FakeDisplayAdb.override, (1260, 5440))
+        self.assertEqual(FakeDisplayAdb.density_override, 420)
+        self.assertTrue(self._state()["display"]["has_override"])
+        logs = "\n".join(line["text"] for line in self.bridge._logs)
+        self.assertIn("加长主屏已生效", logs)
+        self.assertIn("全尺寸截图已保存并打开", logs)
+        json.dumps(self.bridge.poll(), ensure_ascii=False)
+        # 退出程序必须还原（不然就是把用户手机丢在加长状态）
+        self.bridge.shutdown()
+        self.assertIsNone(FakeDisplayAdb.override)
+        self.assertIsNone(FakeDisplayAdb.density_override)
+        self.assertFalse(FakeDisplayAdb.scaling_off)
+        self.assertFalse(self._state()["display"]["has_override"])
+
+    def test_preview_capture_without_display_settings_only_shoots(self):
+        """倍数 1.0 + 密度 0：抓图就是截当前屏幕，一个 set/reset 都不该发。"""
+        with mock.patch.object(UiBridge, "_open_path", return_value=True) as opener:
+            result = self.bridge.preview_capture(make_payload(display_mode=False, display_scale="1.0"))
+            self.assertTrue(result["ok"])
+            self.assertTrue(
+                wait_until(
+                    lambda: bool((self._state()["display"].get("capture") or {}).get("image"))
+                )
+            )
+        opener.assert_called_once()
+        self.assertEqual(
+            [call for call in FakeDisplayAdb.calls if call[0].startswith(("set_", "reset_"))], []
+        )
+
+    def test_preview_capture_rejects_bad_payload(self):
+        result = self.bridge.preview_capture(make_payload(display_scale="abc"))
+        self.assertFalse(result["ok"])
+        self.assertTrue(self.bridge._state["toasts"])
+        self.assertEqual(self._state()["display"]["capture"], {})
+
+    # ---- 实时滑块：apply_display / 缩略图 / 退出复位 ----
+    def test_apply_display_stretches_and_keeps_it(self):
+        """滑块模式要留着加长状态给用户看（不像运行那样跑完自动复位）。"""
+        self.bridge.apply_display(make_payload(display_mode=True, display_density="0"))
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override == (1260, 5440)))
+        self.assertTrue(wait_until(lambda: "已加长" in self._state()["display"]["text"]))
+        self.assertTrue(self._state()["display"]["has_override"])
+        # 留着的状态必须还能被复位（否则就是把用户手机丢在加长状态）
+        self.bridge.shutdown()
+        self.assertIsNone(FakeDisplayAdb.override)
+        self.assertIsNone(FakeDisplayAdb.density_override)
+
+    def test_apply_display_with_density(self):
+        self.bridge.apply_display(
+            make_payload(display_mode=True, display_density="420", display_preview=False)
+        )
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.density_override == 420))
+        self.assertTrue(wait_until(lambda: "密度 420" in self._state()["display"]["text"]))
+        self.bridge.shutdown()
+        self.assertIsNone(FakeDisplayAdb.density_override)
+
+    def test_apply_display_scale_one_resets(self):
+        FakeDisplayAdb.override = (1260, 5440)
+        FakeDisplayAdb.density_override = 420
+        self.bridge.apply_display(make_payload(display_mode=False, display_scale="1.0"))
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override is None))
+        self.assertTrue(wait_until(lambda: "未加长" in self._state()["display"]["text"]))
+        self.assertFalse(self._state()["display"]["has_override"])
+
+    def test_apply_display_rejects_bad_payload(self):
+        result = self.bridge.apply_display(make_payload(display_mode=True, display_scale="abc"))
+        self.assertFalse(result["ok"])
+        self.assertTrue(self.bridge._state["toasts"])
+        self.assertIsNone(FakeDisplayAdb.override)
+
+    def test_apply_display_thumbnail_is_popped_once(self):
+        """缩略图只在 thumb_seq 变化时取一次，不跟着 150ms 轮询搬大图。"""
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_thumb.json", adb_factory=PngScreenshotAdb)
+        bridge.apply_display(make_payload(display_mode=True))
+
+        def thumb_seq() -> int:
+            with bridge._lock:
+                return int(bridge._state["display"].get("thumb_seq") or 0)
+
+        self.assertTrue(wait_until(lambda: thumb_seq() > 0))
+        first = bridge.pop_display_thumb()
+        self.assertTrue(first["thumb"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(bridge.pop_display_thumb()["thumb"], "")     # 取过就没了
+        with bridge._lock:
+            capture = dict(bridge._state["display"]["capture"])
+        self.assertEqual(capture["size"], "1260x5440")
+        self.assertTrue(os.path.isfile(capture["image"]))
+        with open(capture["image"], "rb") as handle:
+            self.assertTrue(handle.read().startswith(b"\x89PNG"))
+        # 缩略图不能把整张 1260x2720 的图塞进状态里
+        self.assertLess(len(first["thumb"]), 200_000)
+        bridge.shutdown()
+
+    def test_apply_display_thumbnail_can_be_turned_off(self):
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_thumb_off.json", adb_factory=PngScreenshotAdb)
+        bridge.apply_display(make_payload(display_mode=True, display_preview=False))
+
+        def text() -> str:
+            with bridge._lock:
+                return str(bridge._state["display"].get("text") or "")
+
+        # 等后台线程整个跑完再收尾，否则它会晚一步去复位，把下一个用例的屏幕也擦掉
+        self.assertTrue(wait_until(lambda: "已加长" in text()))
+        with bridge._lock:
+            self.assertEqual(int(bridge._state["display"].get("thumb_seq") or 0), 0)
+        bridge.shutdown()
+        self.assertIsNone(FakeDisplayAdb.override)
+
+    def test_open_display_capture_without_shot_is_soft(self):
+        self.assertFalse(self.bridge.open_display_capture()["ok"])
+        self.assertTrue(self.bridge._state["toasts"])
+
+    def test_run_session_releases_live_stretch(self):
+        """开跑前要把滑块留下的加长交给管线/复位，不能让两套状态打架。"""
+        FakeDisplayAdb.override = (1260, 5440)
+        held = FakeHolder(FakeDisplayAdb)
+        self.bridge._display_holder = held
+        self.bridge._config = AppConfig(display_mode="off")
+        ran: list[bool] = []
+
+        class FakeSession:
+            def run(self):
+                ran.append(True)
+
+        self.bridge._run_session(FakeSession())
+        self.assertEqual(ran, [True])
+        self.assertTrue(held.restored)
+        self.assertIsNone(FakeDisplayAdb.override)
+        self.assertIsNone(self.bridge._display_holder)
+
+    def test_run_session_hands_stretch_to_pipeline(self):
+        """这次运行本来就要加长：句柄交给管线，别在开跑前复位一遍。"""
+        FakeDisplayAdb.override = (1260, 5440)
+        held = FakeHolder(FakeDisplayAdb)
+        self.bridge._display_holder = held
+        self.bridge._config = AppConfig(display_mode="wide", display_scale=2.0)
+
+        class FakeSession:
+            def run(self):
+                pass
+
+        self.bridge._run_session(FakeSession())
+        self.assertFalse(held.restored)                    # 交给管线了，跑完由管线复位
+        self.assertEqual(FakeDisplayAdb.override, (1260, 5440))
+        self.assertIsNone(self.bridge._display_holder)
+
+    def test_preview_capture_failure_is_soft_and_leaves_no_override(self):
+        class BoomAdb(FakeDisplayAdb):
+            def ensure_device(self):
+                raise AdbError("设备未连接")
+
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_boom.json", adb_factory=BoomAdb)
+        with mock.patch.object(UiBridge, "_open_path", return_value=True):
+            result = bridge.preview_capture(make_payload())
+        self.assertTrue(result["ok"])
+        self.assertTrue(wait_until(lambda: "抓图失败" in bridge._state["display"]["text"]))
+        self.assertTrue(bridge._state["toasts"])
+        self.assertIsNone(FakeDisplayAdb.override)
+
+
+class PanelWindowTests(unittest.TestCase):
+    """主界面四个入口窗口：开窗 / 各窗口的设置读写 / 回填主界面。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.windows: list[tuple] = []
+
+        def factory(title, page, api, width, height):
+            window = FakeWindow(title, page, api, width, height)
+            self.windows.append((title, page, api, width, height))
+            return window
+
+        self.bridge = UiBridge(
+            config_path=os.path.join(self.tmp.name, "drpilot_config.json"),
+            adb_factory=FakeAdb,
+            env_path=os.path.join(self.tmp.name, ".env"),
+            open_window=factory,
+        )
+
+    def _patch(self):
+        return self.bridge.poll()["state"]["form_patch"]
+
+    def test_open_each_panel_uses_its_own_api(self):
+        from drpilot.webui.panels import ActionPanelApi, ModelPanelApi, ModulePanelApi
+        from drpilot.webui.tuner import DisplayTunerApi
+
+        expected = {
+            "action": ("actions", ActionPanelApi),
+            "modules": ("modules", ModulePanelApi),
+            "model": ("model", ModelPanelApi),
+            "tuner": ("tuner", DisplayTunerApi),
+        }
+        for name, (page, api_type) in expected.items():
+            result = self.bridge.open_panel(name, make_payload())
+            self.assertTrue(result["ok"], name)
+            title, got_page, api, width, height = self.windows[-1]
+            self.assertEqual(got_page, page)
+            self.assertIsInstance(api, api_type)
+            self.assertGreaterEqual(width, 800)
+        self.assertEqual(len(self.windows), 4)
+
+    def test_open_panel_twice_reuses_window(self):
+        self.bridge.open_panel("modules", make_payload())
+        result = self.bridge.open_panel("modules", make_payload())
+        self.assertTrue(result.get("existing"))
+        self.assertEqual(len(self.windows), 1)
+
+    def test_unknown_panel_is_rejected(self):
+        self.assertFalse(self.bridge.open_panel("nope", make_payload())["ok"])
+
+    # ---- 翻页动作 ----
+    def test_action_settings_roundtrip_patches_form(self):
+        self.bridge.open_panel("action", make_payload())
+        api = self.windows[0][2]
+        result = api.apply({"kind": "tap", "tap": {"x": 540, "y": 2280, "ms": 90}})
+        self.assertTrue(result["ok"])
+        patch = self._patch()
+        self.assertEqual(patch["page_action"], "tap")
+        self.assertEqual((patch["action_tap_x"], patch["action_tap_y"]), (540, 2280))
+        self.assertEqual(patch["action_tap_ms"], 90)
+        state = self.bridge.action_state()
+        self.assertEqual(state["kind"], "tap")
+        self.assertIn("点按 (540, 2280)", state["summary"])
+
+    def test_action_settings_rejects_tap_without_coordinates(self):
+        result = self.bridge.save_action_settings({"kind": "tap", "tap": {"x": 0, "y": 0}})
+        self.assertFalse(result["ok"])
+        self.assertIn("X", result["error"])
+
+    def test_action_settings_swipe_patches_coordinates(self):
+        self.bridge.save_action_settings({
+            "kind": "swipe",
+            "swipe": {"x1": 100, "y1": 200, "x2": 300, "y2": 400, "duration": 250,
+                      "retries": 3, "retry_wait": 0.8},
+            "reference": "1080x2340",
+        })
+        patch = self._patch()
+        self.assertEqual(patch["page_action"], "swipe")
+        self.assertEqual((patch["swipe_x1"], patch["swipe_y1"]), (100, 200))
+        self.assertEqual((patch["swipe_x2"], patch["swipe_y2"]), (300, 400))
+        self.assertEqual(patch["swipe_duration"], 250)
+        self.assertEqual(patch["swipe_reference"], "1080x2340")
+        self.assertIn("滑动", self.bridge.action_summary())
+
+    def test_clear_recorded_keeps_tap_and_swipe(self):
+        self.bridge.save_action_settings({"kind": "tap", "tap": {"x": 5, "y": 6}})
+        self.bridge._patch_form(next_action=json.dumps([{"kind": "tap", "x": 1, "y": 2}]))
+        self.bridge._update("action", steps=[{"kind": "tap", "x": 1, "y": 2, "duration_ms": 0}])
+        self._patch()                              # 清掉前面累积的回填，只看这一步
+        self.bridge.clear_recorded()
+        patch = self._patch()
+        self.assertEqual(patch["next_action"], "")
+        self.assertNotIn("page_action", patch)     # 只是清了录制，没改选择
+        self.assertEqual(self.bridge.action_state()["record"]["steps"], [])
+
+    # ---- 提取模块 ----
+    def test_module_settings_lists_base_fields_and_modules(self):
+        state = self.bridge.module_settings()
+        names = [item["name"] for item in state["fields"]]
+        self.assertEqual(names, ["题号", "题目", "答案"])
+        self.assertEqual(state["fields"][0]["kind"], "base")
+        self.assertTrue(state["presets"])
+        self.assertIn("题号", state["summary"])
+
+    def test_save_module_settings_patches_both_hidden_inputs(self):
+        result = self.bridge.save_module_settings({"fields": [
+            {"kind": "base", "key": "stem", "in_json": True, "in_markdown": True},
+            {"kind": "module", "name": "考点还原", "aliases": ["考点"], "below_fold": True},
+            {"kind": "module", "name": "标准解析", "in_json": False},
+        ]})
+        self.assertTrue(result["ok"])
+        patch = self._patch()
+        output_fields = json.loads(patch["output_fields"])
+        self.assertEqual([item["key"] for item in output_fields], ["stem"])
+        modules = json.loads(patch["extract_modules"])
+        self.assertEqual([item["name"] for item in modules], ["考点还原", "标准解析"])
+        self.assertFalse(modules[1]["in_json"])
+        # 主界面入口卡片上的摘要也要跟着变
+        self.assertIn("考点还原", self.bridge.panel_summaries()["modules"])
+
+    def test_save_module_settings_rejects_reserved_and_duplicate(self):
+        self.assertFalse(self.bridge.save_module_settings({"fields": [
+            {"kind": "module", "name": "answer"},
+        ]})["ok"])
+        self.assertFalse(self.bridge.save_module_settings({"fields": [
+            {"kind": "module", "name": "考点还原"},
+            {"kind": "module", "name": "考点"},
+        ]})["ok"])
+
+    def test_save_module_settings_can_drop_all_base_fields(self):
+        result = self.bridge.save_module_settings({"fields": [
+            {"kind": "module", "name": "我的模块"},
+        ]})
+        self.assertTrue(result["ok"])
+        self.assertEqual(json.loads(self._patch()["output_fields"]), [])
+        self.assertEqual([item["name"] for item in self.bridge.module_settings()["fields"]], ["我的模块"])
+
+    # ---- 模型服务 ----
+    def test_model_settings_defaults_to_deepseek(self):
+        state = self.bridge.model_settings()
+        self.assertEqual(state["model"], "deepseek-flash")
+        self.assertEqual(state["base_url"], "https://api.deepseek.com")
+        self.assertEqual(state["default_model"], "deepseek-flash")
+
+    def test_save_model_settings_patches_form(self):
+        result = self.bridge.save_model_settings({
+            "model": "deepseek-flash", "base_url": "https://api.deepseek.com/",
+        })
+        self.assertTrue(result["ok"])
+        patch = self._patch()
+        self.assertEqual(patch["model"], "deepseek-flash")
+        self.assertEqual(patch["base_url"], "https://api.deepseek.com")
+        self.assertIn("deepseek-flash", self.bridge.panel_summaries()["model"])
+
+    def test_save_model_settings_validates(self):
+        self.assertFalse(self.bridge.save_model_settings({"model": "", "base_url": "https://x"})["ok"])
+        self.assertFalse(self.bridge.save_model_settings({"model": "m", "base_url": "ftp://x"})["ok"])
+
+    def test_display_tuner_state_reports_requested_vs_accepted(self):
+        state = self.bridge.tuner_state()
+        self.assertIn("requested", state)
+        self.assertFalse(state["requested"]["has"])
+        self.assertIn("limits", state)
+
+
+class TunerWindowTests(unittest.TestCase):
+    """「显示调节」独立窗口：开窗 / 三个参数 / 复位 / 退出清理。"""
+
+    def setUp(self):
+        FakeDisplayAdb.reset()
+        self._min_settle = display_module.MIN_SETTLE_SECONDS
+        display_module.MIN_SETTLE_SECONDS = 0.0
+        self.addCleanup(self._restore_settle)
+        self.windows: list[tuple] = []
+
+        def factory(title, page, api, width, height):
+            window = FakeWindow(title, page, api, width, height)
+            self.windows.append((title, page, api, width, height))
+            return window
+
+        self.bridge = UiBridge(
+            config_path="/tmp/drpilot_bridge_tuner.json",
+            adb_factory=FakeDisplayAdb,
+            open_window=factory,
+        )
+
+    def _restore_settle(self):
+        display_module.MIN_SETTLE_SECONDS = self._min_settle
+
+    def _state(self):
+        with self.bridge._lock:
+            return copy.deepcopy(self.bridge._state)
+
+    def test_open_creates_tuner_window(self):
+        result = self.bridge.open_display_tuner(make_payload())
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.windows), 1)
+        title, page, api, width, height = self.windows[0]
+        self.assertIn("屏幕调节", title)
+        self.assertEqual(page, "tuner")
+        self.assertIsInstance(api, DisplayTunerApi)
+        self.assertGreaterEqual(width, 800)
+
+    def test_open_twice_reuses_the_window(self):
+        self.bridge.open_display_tuner(make_payload())
+        result = self.bridge.open_display_tuner(make_payload())
+        self.assertTrue(result.get("existing"))
+        self.assertEqual(len(self.windows), 1)
+        self.assertTrue(self.windows[0][2].bridge is self.bridge)
+
+    def test_open_without_window_factory_is_soft(self):
+        bridge = UiBridge(config_path="/tmp/drpilot_bridge_nowin.json", adb_factory=FakeDisplayAdb)
+        result = bridge.open_display_tuner(make_payload())
+        self.assertFalse(result["ok"])
+        self.assertTrue(bridge._state["toasts"])
+
+    def test_close_event_clears_reference(self):
+        self.bridge.open_display_tuner(make_payload())
+        window = self.bridge._windows["tuner"]
+        window.events.closed.fire()
+        self.assertNotIn("tuner", self.bridge._windows)
+
+    def test_shutdown_destroys_tuner_window(self):
+        self.bridge.open_display_tuner(make_payload())
+        window = self.bridge._windows["tuner"]
+        self.bridge.shutdown()
+        self.assertTrue(window.destroyed)
+        self.assertEqual(self.bridge._windows, {})
+
+    # ---- 三个参数 ----
+    def test_apply_sets_width_height_density(self):
+        self.bridge.open_display_tuner(make_payload())
+        api = self.windows[0][2]
+        result = api.apply({"scale": 2.0, "width_scale": 1.5, "density": 420})
+        self.assertTrue(result["ok"])
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override == (1890, 5440)))
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.density_override == 420))
+        # 主界面那三个隐藏字段要跟着变：开始提取才会用同一套设置
+        patch = self.bridge.poll()["state"]["form_patch"]
+        self.assertEqual(patch.get("display_scale"), 2.0)
+        self.assertEqual(patch.get("display_width_scale"), 1.5)
+        self.assertEqual(patch.get("display_density"), 420)
+
+    def test_apply_rejects_garbage(self):
+        self.bridge.open_display_tuner(make_payload())
+        api = self.windows[0][2]
+        result = api.apply({"scale": "abc"})
+        self.assertFalse(result["ok"])
+        self.assertIsNone(FakeDisplayAdb.override)
+
+    def test_state_shape_for_the_page(self):
+        self.bridge.open_display_tuner(make_payload(display_scale="2.0", display_density="420"))
+        api = self.windows[0][2]
+        state = api.ready()
+        for key in ("physical", "override", "settings", "limits", "thumb_seq", "original_seq"):
+            self.assertIn(key, state, key)
+        self.assertEqual(state["settings"]["density"], 420)
+        self.assertGreaterEqual(state["limits"]["max_scale"], 2.0)
+        json.dumps(state, ensure_ascii=False)      # pywebview 就是这么传的
+
+    def test_after_apply_state_reports_the_real_override(self):
+        self.bridge.open_display_tuner(make_payload())
+        api = self.windows[0][2]
+        api.apply({"scale": 2.0, "width_scale": 1.5, "density": 0})
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override == (1890, 5440)))
+        self.assertTrue(wait_until(lambda: bool(api.poll()["override"]["has_override"])))
+        state = api.poll()
+        self.assertEqual(state["override"]["width"], 1890)
+        self.assertEqual(state["override"]["height"], 5440)
+
+    def test_reset_from_tuner_clears_override(self):
+        self.bridge.open_display_tuner(make_payload())
+        api = self.windows[0][2]
+        api.apply({"scale": 2.0, "density": 420})
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override == (1260, 5440)))
+        api.reset()
+        self.assertTrue(wait_until(lambda: FakeDisplayAdb.override is None))
+        self.assertIsNone(FakeDisplayAdb.density_override)
+
+    # ---- 「原本」截图 ----
+    def test_original_is_popped_once(self):
+        bridge = UiBridge(
+            config_path="/tmp/drpilot_bridge_original.json",
+            adb_factory=PngScreenshotAdb,
+            open_window=lambda *args: FakeWindow(*args),
+        )
+        bridge.open_display_tuner(make_payload(display_mode=False, display_scale="1.0"))
+
+        def original_seq() -> int:
+            with bridge._lock:
+                return int(bridge._state["display"].get("original_seq") or 0)
+
+        self.assertTrue(wait_until(lambda: original_seq() > 0))
+        first = bridge.pop_original()
+        self.assertTrue(first["thumb"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(first["size"], "1260x2720")
+        self.assertEqual(bridge.pop_original()["thumb"], "")
 
 
 KEY_ENV_NAMES = tuple(

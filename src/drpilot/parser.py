@@ -17,6 +17,7 @@ from typing import Any, Sequence
 
 from .errors import ParseError
 from .models import Question
+from .modules import ModuleSpec
 
 _CODE_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)```", re.DOTALL)
 _WRAPPER_KEYS = ("questions", "data", "items", "result", "results", "list")
@@ -64,6 +65,44 @@ def _decode_first_json(text: str) -> Any:
     return None
 
 
+def _repair_truncated_array(text: str) -> str:
+    """抢救被截断的 JSON 数组：切到最后一个完整的顶层元素并补上 ]。
+
+    模块（考点还原/标准解析）会让输出变长，撞上 max_tokens 时模型会把数组写一半，
+    整批就全废了；这里把已经写完的前几个元素救回来，剩下的仍按占位 + 续跑处理。
+    """
+    start = text.find("[")
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escape = False
+    last_complete = -1
+    for index in range(start, len(text)):
+        ch = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 1:
+                last_complete = index      # 回到数组层：一个完整元素刚结束
+            elif depth == 0:
+                return ""                  # 本来就是完整数组，不需要抢救
+    if last_complete < 0:
+        return ""
+    return text[start : last_complete + 1] + "]"
+
+
 def _unwrap(data: Any) -> list[Any]:
     if isinstance(data, list):
         return data
@@ -83,6 +122,19 @@ def extract_items(text: str) -> list[Any]:
     cleaned = strip_code_fences(text)
     if not cleaned:
         raise ParseError("AI 返回内容为空")
+    # 先严格解析：整段能解析就直接用
+    data, ok = _try_loads(cleaned)
+    if ok:
+        return _unwrap(data)
+
+    # 被 max_tokens 截断的数组：抢救出已写完的元素。
+    # 必须放在下面 _decode_first_json 之前 —— 那个函数会在截断文本里
+    # 从第一个 { 开始 raw_decode，只返回第 1 个元素，把后面的全丢掉。
+    if cleaned.lstrip().startswith("["):
+        data, ok = _try_loads(_repair_truncated_array(cleaned))
+        if ok:
+            return _unwrap(data)
+
     data = _decode_first_json(cleaned)
     if data is not None:
         return _unwrap(data)
@@ -106,15 +158,27 @@ def extract_items(text: str) -> list[Any]:
 
 
 def _is_meaningful(question: Question) -> bool:
-    return bool(question.stem or question.options or question.answer or question.id or question.screen_id)
+    return bool(
+        question.stem
+        or question.options
+        or question.answer
+        or question.modules
+        or question.id
+        or question.screen_id
+    )
 
 
 def parse_ai_response(
     text: str,
     expected_count: int | None = None,
     expected_ids: Sequence[int | None] | None = None,
+    modules: Sequence[ModuleSpec] | None = None,
 ) -> list[Question | None]:
-    """解析并返回与图片一一对应的列表；无法识别的槽位为 None。"""
+    """解析并返回与图片一一对应的列表；无法识别的槽位为 None。
+
+    modules 是本次运行的提取模块清单，透传给 Question.from_dict 把
+    「考点还原」「标准解析」这类自定义键收进 Question.modules。
+    """
     raw_items = extract_items(text)
     questions: list[Question | None] = []
     for item in raw_items:
@@ -122,7 +186,7 @@ def parse_ai_response(
             questions.append(None)
             continue
         try:
-            question = Question.from_dict(item)
+            question = Question.from_dict(item, modules=modules)
         except Exception:
             questions.append(None)
             continue
@@ -145,10 +209,14 @@ def parse_ai_response(
     return questions
 
 
-def parse_questions(text: str, expected_ids: Sequence[int | None]) -> list[Question]:
+def parse_questions(
+    text: str,
+    expected_ids: Sequence[int | None],
+    modules: Sequence[ModuleSpec] | None = None,
+) -> list[Question]:
     """解析并补齐占位，保证长度等于 expected_ids（主要给测试和兜底用）。"""
     ids = list(expected_ids)
-    parsed = parse_ai_response(text, expected_count=len(ids), expected_ids=ids)
+    parsed = parse_ai_response(text, expected_count=len(ids), expected_ids=ids, modules=modules)
     result: list[Question] = []
     for index, question in enumerate(parsed):
         if question is None:

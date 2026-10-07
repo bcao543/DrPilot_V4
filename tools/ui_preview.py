@@ -6,7 +6,8 @@
 
     python tools/ui_preview.py                       # 默认 1180x920
     python tools/ui_preview.py --size 1024x700       # 小窗口
-    python tools/ui_preview.py --expand              # 展开「翻页动作（点击 / 滑动）」
+    python tools/ui_preview.py --expand              # 展开「翻页动作」与「提取模块」两张卡
+    python tools/ui_preview.py --modules             # 只展开「提取模块（额外内容块）」
     python tools/ui_preview.py --out tools/ui.png
 """
 
@@ -21,7 +22,16 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "src" / "drpilot" / "webui" / "assets" / "index.html"
+ASSETS = ROOT / "src" / "drpilot" / "webui" / "assets"
+INDEX = ASSETS / "index.html"
+# 主界面 + 四个入口窗口（都不需要后端：没有后端时页面自己进「预览模式」）
+PAGES = {
+    "main": INDEX,
+    "actions": ASSETS / "actions.html",
+    "modules": ASSETS / "modules.html",
+    "model": ASSETS / "model.html",
+    "tuner": ASSETS / "tuner.html",
+}
 
 WINDOWS_BROWSERS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -95,10 +105,15 @@ def browser_url(path: Path) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="渲染 DrPilot 界面预览图")
+    parser = argparse.ArgumentParser(description="渲染 DrPilot 界面预览图（单页）")
     parser.add_argument("--size", default="1180x920", help="窗口尺寸，如 1180x920")
     parser.add_argument("--out", default=str(ROOT / "tools" / "ui_preview.png"))
-    parser.add_argument("--expand", action="store_true", help="展开「翻页动作（点击 / 滑动）」面板")
+    parser.add_argument(
+        "--page",
+        default="main",
+        choices=("main", "actions", "modules", "model", "tuner"),
+        help="渲染哪个页面（主界面 / 翻页动作 / 提取模块 / 模型服务 / 屏幕调节）",
+    )
     parser.add_argument("--idle", action="store_true", help="按「未运行」的样子渲染（灰色静止的马）")
     args = parser.parse_args()
 
@@ -112,18 +127,13 @@ def main() -> int:
     if not browser:
         print("没找到 Edge / Chrome，无法生成预览图。", file=sys.stderr)
         return 1
-    if not INDEX.is_file():
-        print(f"界面文件缺失：{INDEX}", file=sys.stderr)
-        return 1
-
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    fragment = ""
-    if args.expand:
-        fragment = "expand"
-    if args.idle:
-        fragment = (fragment + ",idle") if fragment else "idle"
-    url = browser_url(INDEX) + (("#" + fragment) if fragment else "")
+    target = PAGES.get(args.page, INDEX)
+    if not target.is_file():
+        print(f"界面文件缺失：{target}", file=sys.stderr)
+        return 1
+    url = browser_url(target) + ("#idle" if args.idle else "")
     profile = Path(tempfile.gettempdir()) / "drpilot_uipreview_profile"
 
     cmd = [

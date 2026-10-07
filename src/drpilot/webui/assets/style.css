@@ -290,6 +290,134 @@ input::selection{background:rgba(59,130,246,.25)}
 .action-steps{margin:0;padding-left:1.3rem;display:flex;flex-direction:column;gap:2px}
 .action-steps:empty{display:none}
 .action-steps li{font-size:12px;color:var(--muted);line-height:1.6}
+/* 提取模块：一行一个模块（名称 / 别名 / 首屏内 / 写进 Markdown / 上下移 / 删除） */
+.module-list{display:flex;flex-direction:column;gap:8px}
+.module-list:empty{display:none}
+.module-row{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:7px 9px;border-radius:var(--r-sm);background:var(--surface-deep);
+}
+.module-row input:not([type]){background:var(--surface)}
+.module-row .module-name{width:150px}
+.module-row .module-aliases{flex:1;min-width:150px}
+.module-row .switch{font-size:12px;gap:7px}
+.module-row .btn{padding:6px 9px;font-size:11.5px}
+#module-presets{row-gap:7px}
+.preset-chip{padding:5px 10px;font-size:11.5px}
+
+/* 加长主屏的调参界面在独立的 tuner.html 里（见 tuner.css），主页面只留一个入口 */
+
+/* ---------- 入口卡片（主页面点一下 -> 打开独立设置窗口） ---------- */
+.entries{display:flex;flex-direction:column;gap:9px}
+.entry{
+  display:flex;align-items:center;gap:12px;width:100%;text-align:left;cursor:pointer;
+  border:0;background:var(--surface);color:var(--ink-soft);font:inherit;padding:10px 13px;
+  border-radius:var(--r-md);
+  box-shadow:4px 4px 10px var(--sh-dark),-4px -4px 10px var(--sh-light);
+  transition:box-shadow .12s ease,transform .12s ease,color .12s ease;
+}
+.entry:hover{color:var(--blue-deep)}
+.entry:active{transform:translateY(1px);box-shadow:inset 3px 3px 7px var(--sh-dark),inset -3px -3px 7px var(--sh-light)}
+.entry .entry-icon{
+  width:30px;height:30px;flex:none;border-radius:10px;display:grid;place-items:center;font-size:14px;
+  background:var(--surface-deep);
+  box-shadow:inset 2px 2px 5px var(--sh-dark),inset -2px -2px 5px var(--sh-light);
+}
+.entry .entry-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.entry .entry-name{font-weight:700;font-size:12.5px;color:var(--ink)}
+.entry .entry-note{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.entry .entry-go{flex:none;font-size:11.5px;color:var(--muted)}
+.entry[disabled]{opacity:.5;cursor:not-allowed;color:var(--muted)}
+
+/* ---------- 独立窗口（翻页动作 / 提取模块 / 模型服务 / 屏幕调节） ---------- */
+.panel-body{
+  margin:0;padding:14px 16px 16px;height:100vh;overflow:hidden;
+  background:var(--bg);color:var(--ink);
+  font:13px/1.5 "Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:var(--gap);
+}
+.panel-body.single{grid-template-rows:auto minmax(0,1fr);}
+.panel-top{display:flex;align-items:center;gap:12px;padding:0 4px}
+.panel-top h1{font-size:16px;font-weight:700}
+.panel-top p{color:var(--muted);font-size:11.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel-top-actions{margin-left:auto;display:flex;align-items:center;gap:9px;flex:none;white-space:nowrap}
+.panel-scroll{display:flex;flex-direction:column;gap:var(--gap);min-height:0;overflow:auto;margin:-6px -8px;padding:6px 8px}
+.panel-foot{
+  display:flex;align-items:center;gap:11px;min-height:26px;
+}
+.panel-foot .spacer{flex:1}
+.panel-hint{color:var(--muted);font-size:11.5px}
+
+/* ---------- 提示条 ---------- */
+.note{
+  display:flex;gap:8px;align-items:flex-start;padding:9px 12px;border-radius:var(--r-sm);
+  background:var(--surface-deep);color:var(--ink-soft);font-size:11.5px;line-height:1.65;
+}
+.note.warn{color:#8a6410}
+.note.ok{color:#1f6f4a}
+.note.danger{color:#a83f34}
+.note .note-icon{flex:none}
+
+/* ---------- 单选卡片（翻页动作三选一） ---------- */
+.choices{display:flex;gap:10px;flex-wrap:wrap}
+.choice{
+  display:flex;align-items:center;gap:9px;padding:10px 14px;border-radius:var(--r-md);cursor:pointer;
+  background:var(--surface);color:var(--ink-soft);font-size:12.5px;
+  box-shadow:4px 4px 10px var(--sh-dark),-4px -4px 10px var(--sh-light);
+  transition:color .12s ease,box-shadow .12s ease;
+}
+.choice input{display:none}
+.choice:hover{color:var(--blue-deep)}
+.choice.on{
+  color:var(--blue-deep);font-weight:600;
+  box-shadow:inset 3px 3px 7px var(--sh-dark),inset -3px -3px 7px var(--sh-light);
+}
+.choice .choice-icon{font-size:14px}
+
+/* ---------- 滑块（屏幕调节：宽 / 长 / 密度） ---------- */
+.slider-row{display:flex;align-items:center;gap:12px}
+.slider-row>.slider-name{min-width:34px;color:var(--muted);font-size:12px;flex:none}
+input[type=range]{
+  -webkit-appearance:none;appearance:none;flex:1;min-width:110px;height:22px;background:transparent;
+}
+input[type=range]::-webkit-slider-runnable-track{
+  height:10px;border-radius:999px;background:var(--surface-deep);
+  box-shadow:inset 2px 2px 5px var(--sh-dark),inset -2px -2px 5px var(--sh-light);
+}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;width:20px;height:20px;margin-top:-5px;border-radius:50%;
+  background:linear-gradient(145deg,#4f8df8,#2f6fe0);
+  box-shadow:2px 2px 6px rgba(47,111,224,.45),-2px -2px 5px var(--sh-light);
+}
+input[type=range]::-moz-range-track{
+  height:10px;border-radius:999px;background:var(--surface-deep);
+  box-shadow:inset 2px 2px 5px var(--sh-dark),inset -2px -2px 5px var(--sh-light);
+}
+input[type=range]::-moz-range-thumb{
+  width:18px;height:18px;border:0;border-radius:50%;
+  background:linear-gradient(145deg,#4f8df8,#2f6fe0);box-shadow:2px 2px 6px rgba(47,111,224,.45);
+}
+input[type=range][disabled]::-webkit-slider-thumb{background:var(--muted);box-shadow:none}
+input[type=range][disabled]::-moz-range-thumb{background:var(--muted);box-shadow:none}
+.node-box{display:flex;flex-direction:column;gap:10px}
+.node-box>.row{padding:2px 2px}
+
+/* ---------- 模块清单（提取模块窗口） ---------- */
+.module-row .module-keys{display:flex;gap:14px;align-items:center}
+.module-row .module-name{width:132px}
+.module-row .module-aliases{flex:1;min-width:120px}
+.module-row.base{background:var(--surface)}
+.module-row .module-tag{
+  flex:none;font-size:10.5px;color:var(--blue-deep);padding:2px 7px;border-radius:999px;
+  background:rgba(59,130,246,.12);
+}
+.module-row .module-note{
+  flex-basis:100%;color:var(--muted);font-size:11px;line-height:1.5;
+}
+
+/* ---------- 日志卡片（主页面）里的小结构 ---------- */
+.flat-hint{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
 @media (max-width:900px){
   .grid{grid-template-columns:minmax(0,1fr)}
 }

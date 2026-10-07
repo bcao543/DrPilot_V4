@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrPilot · 翻页动作</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="panel-body">
+  <header class="panel-top">
+    <div>
+      <h1>翻页动作</h1>
+      <p>点按 / 滑动 / 录制动作 三选一：选中哪个就用哪个，改完点「应用」回填主界面</p>
+    </div>
+    <div class="panel-top-actions">
+      <span class="pill" id="pill-device"><i class="dot"></i><span id="pill-device-text">设备：读取中…</span></span>
+      <button class="btn small" id="btn-test">试一次</button>
+      <button class="btn primary small" id="btn-apply">应用</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <section class="card">
+      <div class="card-head">
+        <h2>用哪一种</h2><span class="hint" id="summary">—</span>
+      </div>
+      <div class="choices" id="choices">
+        <label class="choice" data-kind="tap">
+          <input type="radio" name="kind" value="tap"><span class="choice-icon">①</span><span>点按</span>
+        </label>
+        <label class="choice" data-kind="swipe">
+          <input type="radio" name="kind" value="swipe"><span class="choice-icon">②</span><span>滑动</span>
+        </label>
+        <label class="choice" data-kind="record">
+          <input type="radio" name="kind" value="record"><span class="choice-icon">③</span><span>录制动作</span>
+        </label>
+      </div>
+      <p class="note" id="kind-note">正在读取当前设置…</p>
+    </section>
+
+    <section class="card" id="card-tap">
+      <div class="card-head">
+        <h2>点按参数</h2><span class="hint">手机上「下一题」按钮的屏幕像素坐标</span>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <label class="field"><span>X</span><input id="tap_x" class="w-md num" inputmode="numeric" placeholder="X"></label>
+          <label class="field"><span>Y</span><input id="tap_y" class="w-md num" inputmode="numeric" placeholder="Y"></label>
+          <label class="field"><span>按住</span><input id="tap_ms" class="w-sm num" inputmode="numeric" placeholder="80"><em>ms</em></label>
+        </div>
+        <p class="note">点按坐标不随分辨率缩放：换机型要重新填。只想试一下坐标对不对，就点右上角「试一次」。</p>
+      </div>
+    </section>
+
+    <section class="card" id="card-swipe">
+      <div class="card-head">
+        <h2>滑动参数</h2><span class="hint">按基准分辨率自动缩放到当前机型</span>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <span class="group-label">起点</span>
+          <label class="field"><em>X</em><input id="swipe_x1" class="w-sm num" placeholder="X"></label>
+          <label class="field"><em>Y</em><input id="swipe_y1" class="w-sm num" placeholder="Y"></label>
+          <span class="group-label">终点</span>
+          <label class="field"><em>X</em><input id="swipe_x2" class="w-sm num" placeholder="X"></label>
+          <label class="field"><em>Y</em><input id="swipe_y2" class="w-sm num" placeholder="Y"></label>
+        </div>
+        <div class="row">
+          <label class="field"><span>时长</span><input id="swipe_duration" class="w-xs num" placeholder="150"><em>ms</em></label>
+          <label class="field"><span>重试</span><input id="swipe_retries" class="w-xs num" placeholder="5"></label>
+          <label class="field"><span>重试等待</span><input id="swipe_retry_wait" class="w-sm num" placeholder="1.2"><em>s</em></label>
+        </div>
+        <div class="row">
+          <label class="field grow"><span>基准分辨率</span><input id="swipe_reference" placeholder="留空 = 首次运行自动记录"></label>
+          <button class="btn small" id="btn-set-reference">设为当前设备</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="card-record">
+      <div class="card-head">
+        <h2>录制动作</h2><span class="hint">在手机上做一次「下一题」，程序把触摸序列记下来</span>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <button class="btn small primary" id="btn-record-start">开始录制</button>
+          <button class="btn small" id="btn-record-stop">停止录制</button>
+          <button class="btn small ghost" id="btn-record-clear">清除录制</button>
+          <span class="hint" id="record-note">未录制</span>
+        </div>
+        <div class="row"><ol class="action-steps" id="action-steps"></ol></div>
+        <p class="note">录制与试动作都会让手机前进一题：开始提取前请把手机切回起始题。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="panel-foot">
+    <span class="panel-hint" id="notice">正在读取当前设置…</span>
+    <span class="spacer"></span>
+    <span class="panel-hint">「应用」写入主界面；「试一次」会先应用再验证</span>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="panel.js"></script>
+  <script src="actions.js"></script>
+</body>
+</html>

@@ -17,6 +17,7 @@ import unittest
 from drpilot.adb import DeviceInfo
 from drpilot.ai import ModelCheckResult
 from drpilot.config import AppConfig, resolve_output_paths
+from drpilot.models import Question
 from drpilot.pipeline import PilotSession
 
 
@@ -515,6 +516,372 @@ class PipelineTests(unittest.TestCase):
         session = PilotSession(config, adb=FakeAdb(), ai_factory=lambda key, cfg: FakeAi())
         self.assertFalse(session.run())
         self.assertIsNotNone(session.error)
+
+
+class ModuleFakeAi(FakeAi):
+    """会按模块返回正文的假 AI，并记录收到的系统提示词。"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.system_prompts: list[str] = []
+
+    def complete(self, messages, meta=""):
+        text = super().complete(messages, meta)
+        self.system_prompts.append(str(messages[0]["content"]))
+        if meta == "preflight":
+            return text
+        items = json.loads(text)
+        for item in items:
+            item["考点还原"] = f"考点还原正文{item['screen_id']}"
+            item["标准解析"] = f"解析正文{item['screen_id']}"
+        return json.dumps(items, ensure_ascii=False)
+
+
+class DisplayFakeAdb(FakeAdb):
+    """FakeAdb + 加长主屏需要的 wm 命令，行为照抄真机（过大尺寸静默忽略）。"""
+
+    def __init__(self, *, max_height: int = 4680, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.physical = (1080, 2340)
+        self.override: tuple[int, int] | None = None
+        self.density_override: int | None = None
+        self.scaling_off = False
+        self.max_height = max_height
+        self.display_calls: list[tuple] = []
+        self.shots = 0
+
+    # ---- 给 DisplayController 用 ----
+    def run(self, args, check: bool = True, **kwargs):
+        args = tuple(args)
+        if args == ("shell", "wm", "size"):
+            lines = [f"Physical size: {self.physical[0]}x{self.physical[1]}"]
+            if self.override:
+                lines.append(f"Override size: {self.override[0]}x{self.override[1]}")
+            return "\n".join(lines)
+        if args == ("shell", "wm", "density"):
+            lines = ["Physical density: 520"]
+            if self.density_override:
+                lines.append(f"Override density: {self.density_override}")
+            return "\n".join(lines)
+        if args == ("shell", "dumpsys", "window", "displays"):
+            return "noscale" if self.scaling_off else ""
+        return ""
+
+    def wm_size(self):
+        return self.override or self.physical
+
+    def set_wm_size(self, width, height):
+        self.display_calls.append(("set_wm_size", int(width), int(height)))
+        if int(height) <= self.max_height:
+            self.override = (int(width), int(height))
+        return ""
+
+    def reset_wm_size(self):
+        self.display_calls.append(("reset_wm_size",))
+        self.override = None
+
+    def set_wm_density(self, density):
+        self.display_calls.append(("set_wm_density", int(density)))
+        self.density_override = int(density)
+
+    def reset_wm_density(self):
+        self.display_calls.append(("reset_wm_density",))
+        self.density_override = None
+
+    def set_wm_scaling(self, mode):
+        self.display_calls.append(("set_wm_scaling", str(mode)))
+        self.scaling_off = str(mode) == "off"
+
+    def screenshot(self):
+        # 第 2~6 张给「加长屏等稳定」用：连续相同即视为稳定，测试不用真等 3 秒；
+        # 之后恢复成每张都不同的画面，避免触发「重复截图」重试逻辑
+        self.shots += 1
+        if 2 <= self.shots <= 3:
+            return b"SETTLE"
+        self.counter += 1
+        return b"IMG-%03d" % self.counter
+
+    def named(self, name: str) -> list[tuple]:
+        return [call for call in self.display_calls if call[0] == name]
+
+
+class ModuleAndDisplayTests(unittest.TestCase):
+    """提取模块 + 加长主屏的端到端行为。"""
+
+    def setUp(self):
+        # 真机上加长屏要等约 3s 画面稳定；单测把等待下限与轮询间隔压到近乎 0
+        from drpilot import display as display_module
+
+        self._patched = (
+            display_module.MIN_SETTLE_SECONDS,
+            display_module.SETTLE_INTERVAL,
+            display_module.DEFAULT_SETTLE_TIMEOUT,
+        )
+        display_module.MIN_SETTLE_SECONDS = 0.0
+        display_module.SETTLE_INTERVAL = 0.01
+        # 设备拒绝某个高度时不会 relayout，画面永远不「稳定」：上限必须压小
+        display_module.DEFAULT_SETTLE_TIMEOUT = 0.05
+
+    def tearDown(self):
+        from drpilot import display as display_module
+
+        (
+            display_module.MIN_SETTLE_SECONDS,
+            display_module.SETTLE_INTERVAL,
+            display_module.DEFAULT_SETTLE_TIMEOUT,
+        ) = self._patched
+
+    def _run(self, tmp, *, total=3, config_overrides=None, ai_factory=None, adb=None):
+        config = AppConfig(
+            page_from=1,
+            page_to=total,
+            textbook="生物化学与分子生物学",
+            chapter="第三章 核酸的结构与功能",
+            chapter_total=211,
+            output_dir=tmp,
+            batch_size=2,
+            workers=1,
+            wait=0.0,
+            retry_wait=0.0,
+            api_keys=["test-key"],
+            **(config_overrides or {}),
+        )
+        config.normalize()
+        prompts: list[str] = []
+        factory = ai_factory or (lambda key, cfg: ModuleFakeAi(start=1))
+
+        session = PilotSession(
+            config,
+            adb=adb if adb is not None else FakeAdb(),
+            ai_factory=factory,
+            image_encoder=lambda data: base64.b64encode(data).decode("ascii"),
+            on_log=lambda message: None,
+            model_checker=lambda *a, **k: ModelCheckResult(True, "m", "u", "ok"),
+        )
+        return session, session.run(), prompts
+
+    def _records(self, session):
+        with open(session.output_paths["jsonl"], encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_modules_land_in_prompt_jsonl_and_markdown(self):
+        from drpilot.modules import modules_to_payload, parse_modules_text
+
+        specs = parse_modules_text("考点还原,标准解析")
+        with tempfile.TemporaryDirectory() as tmp:
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={"modules": modules_to_payload(specs)},
+            )
+            self.assertTrue(ok)
+            records = self._records(session)
+            self.assertEqual(len(records), 3)
+            for record in records:
+                self.assertEqual(
+                    record["modules"],
+                    {
+                        "考点还原": f"考点还原正文{record['id']}",
+                        "标准解析": f"解析正文{record['id']}",
+                    },
+                )
+            with open(session.output_paths["markdown"], encoding="utf-8") as handle:
+                markdown = handle.read()
+            self.assertIn("### **考点还原**", markdown)
+            self.assertIn("### **标准解析**", markdown)
+            self.assertNotIn("---", markdown)
+            prompt = session.system_prompt
+            self.assertIn("考点还原", prompt)
+            self.assertIn("严禁编造", prompt)
+            self.assertEqual(session.diagnostics()["modules"], ["考点还原", "标准解析"])
+
+    def test_without_modules_output_has_no_modules_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, ok, _ = self._run(tmp)
+            self.assertTrue(ok)
+            for record in self._records(session):
+                self.assertNotIn("modules", record)
+            self.assertNotIn("考点还原", session.system_prompt)
+
+    def test_required_module_missing_is_reported(self):
+        from drpilot.modules import modules_to_payload, parse_modules_text
+
+        specs = parse_modules_text("考点还原")
+        payload = modules_to_payload(specs)
+        payload[0]["required"] = True
+
+        class NoModuleAi(FakeAi):
+            def complete(self, messages, meta=""):
+                text = super().complete(messages, meta)
+                if meta == "preflight":
+                    return text
+                items = json.loads(text)
+                for item in items:
+                    item.pop("考点还原", None)
+                return json.dumps(items, ensure_ascii=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={"modules": payload},
+                ai_factory=lambda key, cfg: NoModuleAi(start=1),
+            )
+            self.assertTrue(ok)
+            self.assertEqual(session.diagnostics()["missing_modules"], ["考点还原"])
+
+    def test_display_wide_applies_and_restores_and_keeps_swipe_scale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = DisplayFakeAdb()
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={"display_mode": "wide", "display_scale": 2.0},
+                adb=adb,
+            )
+            self.assertTrue(ok)
+            self.assertEqual(adb.named("set_wm_size"), [("set_wm_size", 1080, 4680)])
+            self.assertEqual(len(adb.named("reset_wm_size")), 1)
+            self.assertIsNone(adb.override)
+            result = session.diagnostics()["display"]
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["actual"], "1080x4680")
+            # 关键：加长屏下翻页坐标仍按物理分辨率换算，y 不会被放大 2 倍
+            self.assertEqual(adb.last_swipe, (1060, 553, 270, 551, 150))
+
+    def test_display_wide_restores_even_when_run_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = DisplayFakeAdb()
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={"display_mode": "wide", "display_scale": 2.0},
+                adb=adb,
+            )
+            self.assertTrue(ok)
+            self.assertIsNone(adb.override)
+
+    def test_display_density_only_without_stretching(self):
+        """倍数 1.0 + 密度 420：只改密度，wm size 一动不动，跑完照样复位。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = DisplayFakeAdb()
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={
+                    "display_mode": "wide", "display_scale": 1.0, "display_density": 420
+                },
+                adb=adb,
+            )
+            self.assertTrue(ok)
+            self.assertEqual(adb.named("set_wm_size"), [])
+            self.assertEqual(adb.named("set_wm_density"), [("set_wm_density", 420)])
+            self.assertEqual(len(adb.named("reset_wm_density")), 1)
+            result = session.diagnostics()["display"]
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["density_only"])
+
+    def test_display_off_never_touches_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = DisplayFakeAdb()
+            _, ok, _ = self._run(tmp, adb=adb)
+            self.assertTrue(ok)
+            self.assertEqual(adb.display_calls, [])
+
+    def test_display_falls_back_when_device_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = DisplayFakeAdb(max_height=3510)      # 2.0 被拒，1.5 通过
+            session, ok, _ = self._run(
+                tmp,
+                config_overrides={"display_mode": "wide", "display_scale": 2.0},
+                adb=adb,
+            )
+            self.assertTrue(ok)
+            result = session.diagnostics()["display"]
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["actual"], "1080x3510")
+
+
+class RecoverMissingTests(unittest.TestCase):
+    """模型回复不完整（多为 max_tokens 截断）时逐张重问，别把整批记成失败。"""
+
+    def _session(self, logs: list[str]) -> PilotSession:
+        config = AppConfig(
+            page_from=1, page_to=3, output_dir=".", batch_size=3, workers=1,
+            api_keys=["test-key"],
+        )
+        config.normalize()
+        return PilotSession(config, on_log=logs.append)
+
+    def test_missing_slots_are_reasked_one_by_one(self):
+        logs: list[str] = []
+        session = self._session(logs)
+        asked: list[str] = []
+
+        class OneShot:
+            def complete(self, messages, meta=""):
+                asked.append(meta)
+                number = 2 if len(asked) == 1 else 3
+                return json.dumps(
+                    [{"screen_id": number, "type": "single", "stem": f"题干{number}",
+                      "options": {"A": "甲"}, "answer": "A"}],
+                    ensure_ascii=False,
+                )
+
+        items = [("enc1", 1), ("enc2", 2), ("enc3", 3)]
+        parsed: list[Question | None] = [Question(id=1, stem="题干1", answer="A"), None, None]
+        out = session._recover_missing(parsed, items, [1, 2, 3], 1, 0, OneShot())
+        # 题号仍由 _assign_questions 按「截图题号优先」落定（和 worker 里的顺序一致）
+        assigned = session._assign_questions(out, [1, 2, 3], 1, 0)
+        self.assertEqual([q.id for q in assigned], [1, 2, 3])
+        self.assertEqual(len(asked), 2)                      # 缺的两题各重问一次
+        self.assertEqual(session.diagnostics()["failed_question_numbers"], [])
+        self.assertTrue(any("逐张重问" in line for line in logs))
+
+    def test_still_missing_is_recorded_as_failure(self):
+        logs: list[str] = []
+        session = self._session(logs)
+
+        class Broken:
+            def complete(self, messages, meta=""):
+                raise RuntimeError("模拟调用失败")
+
+        out = session._recover_missing([None, None], [("e1", 1), ("e2", 2)], [1, 2], 1, 0, Broken())
+        self.assertEqual(out, [None, None])
+        diag = session.diagnostics()
+        self.assertEqual(diag["failed_question_numbers"], [1, 2])
+        self.assertTrue(diag["batch_failures"])
+        self.assertTrue(any("仍未识别" in line for line in logs))
+
+
+class StalledCaptureTests(unittest.TestCase):
+    """翻页失效（画面一直不变）时必须停下来，不能把同一张图当成下一题写进去。"""
+
+    class StuckAdb(FakeAdb):
+        def screenshot(self):
+            return b"SAME-FRAME"
+
+    def test_stalled_paging_stops_capture_and_records_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs: list[str] = []
+            config = AppConfig(
+                page_from=1, page_to=5, textbook="书", chapter="球菌", chapter_total=9,
+                output_dir=tmp, batch_size=2, workers=1, wait=0.0, retry_wait=0.0,
+                max_swipe_retries=2, api_keys=["test-key"], preflight=False,
+                check_model=False,
+            )
+            config.normalize()
+            session = PilotSession(
+                config,
+                adb=self.StuckAdb(),
+                ai_factory=lambda key, cfg: FakeAi(start=1, ai_preflight=(1, 9)),
+                image_encoder=lambda data: base64.b64encode(data).decode("ascii"),
+                on_log=logs.append,
+            )
+            self.assertTrue(session.run())
+            self.assertTrue(session.capture_stalled)
+            with open(session.output_paths["jsonl"], encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual([record["id"] for record in records], [1])   # 没有伪造第 2 题
+            diag = session.diagnostics()
+            self.assertTrue(diag["capture_stalled"])
+            self.assertEqual(diag["failed_question_numbers"], [2])
+            self.assertTrue(any("翻页失败" in line for line in logs))
 
 
 if __name__ == "__main__":

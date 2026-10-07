@@ -18,9 +18,26 @@ from typing import Any, Iterable, Mapping
 from .actions import normalize_steps, steps_to_payload
 from .errors import ConfigError
 from .fileio import atomic_write_text, read_json_file
+from .modules import (
+    ModuleSpec,
+    default_output_fields,
+    modules_to_payload,
+    normalize_modules,
+    normalize_output_fields,
+    output_field_map,
+)
 
-DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
+# 默认模型服务：DeepSeek 官方接口（GUI「模型服务」窗口里的初始值）
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-flash"
+
+# 老版本的默认值：配置文件里存着这两个值（说明用户从没改过）时，
+# 读配置时一并换成新默认，免得「改了默认值」对新老安装都不生效
+LEGACY_DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
+LEGACY_DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+
+# 翻页动作的选择：auto = 旧行为（录制动作 > 手动点按 > 滑动坐标）
+PAGE_ACTIONS = ("auto", "tap", "swipe", "record")
 
 DEFAULT_SWIPE_START_X = 1060
 DEFAULT_SWIPE_START_Y = 553
@@ -243,6 +260,8 @@ class AppConfig:
     # 单次 AI 调用的总时间预算（含重试），0 = 自动（请求超时 x2 + 10s）
     request_deadline: float = 0.0
     jpeg_quality: int = 65
+    # 单次 AI 回复的最大 token 数（模块多、正文长时调大；避免 JSON 被截断）
+    max_tokens: int = 4096
 
     # 重试
     max_retries: int = 5
@@ -264,6 +283,32 @@ class AppConfig:
     # 翻页动作（GUI 录制得到，tap/swipe/path/key/wait 步骤列表）；
     # 为空时回退到上面的固定滑动坐标，保持旧配置行为不变
     next_action: list[dict[str, Any]] = field(default_factory=list)
+
+    # 用哪一种翻页方式（GUI 的「翻页动作」窗口里三选一）：
+    #   auto   = 录制动作 > 手动点按 > 滑动坐标（旧行为，CLI 默认）
+    #   tap    = 只用下面的手动点按坐标
+    #   swipe  = 只用 swipe_* 滑动坐标
+    #   record = 只用 next_action 里录制的动作
+    page_action: str = "auto"
+    tap_x: int = 0
+    tap_y: int = 0
+    tap_ms: int = 80
+
+    # 提取模块：除题干/选项/答案之外，用户还想提取哪些内容块
+    # （每项是 ModuleSpec 的纯数据形式，见 modules.py）
+    modules: list[dict[str, Any]] = field(default_factory=list)
+
+    # 题目本体字段写不写进 JSONL / Markdown（每项 {"key","in_json","in_markdown"}，
+    # 见 modules.BASE_FIELDS）；删掉某项就是不写进文件，识别与翻页照旧
+    output_fields: list[dict[str, Any]] = field(default_factory=default_output_fields)
+
+    # 加长主屏：把逻辑屏高度临时放大，一屏装下考点还原/标准解析等首屏之外的内容。
+    # off = 不改手机显示设置（默认）；wide = 运行期间临时加长，结束/异常都会复位。
+    display_mode: str = "off"
+    display_scale: float = 2.0     # 逻辑高 = 物理高 × scale（实测 >2 会被系统静默忽略）
+    display_width_scale: float = 1.0  # 逻辑宽 = 物理宽 × width_scale（1.0 = 不加宽）
+    display_density: int = 0       # 0 = 不改密度（保住字形大小）；420 可用但字形会缩小
+    display_scaling: str = "auto"  # off = 物理屏 1:1 裁剪（不变形），不影响截图内容
 
     # 设备
     serial: str | None = None
@@ -318,6 +363,7 @@ class AppConfig:
         self.request_timeout = max(1.0, _to_float(self.request_timeout, 60.0))
         self.request_deadline = max(0.0, _to_float(self.request_deadline, 0.0))
         self.jpeg_quality = min(100, max(1, _to_int(self.jpeg_quality, 65)))
+        self.max_tokens = max(256, _to_int(self.max_tokens, 4096))
         self.max_retries = max(1, _to_int(self.max_retries, 1))
         self.retry_delay = max(0.0, _to_float(self.retry_delay, 0.0))
         self.retry_backoff = max(1.0, _to_float(self.retry_backoff, 1.0))
@@ -331,6 +377,25 @@ class AppConfig:
         self.swipe_reference_width = max(0, _to_int(self.swipe_reference_width, 0))
         self.swipe_reference_height = max(0, _to_int(self.swipe_reference_height, 0))
         self.next_action = steps_to_payload(normalize_steps(self.next_action))
+        self.page_action = str(self.page_action or "auto").strip().lower()
+        if self.page_action not in PAGE_ACTIONS:
+            self.page_action = "auto"
+        self.tap_x = max(0, _to_int(self.tap_x, 0))
+        self.tap_y = max(0, _to_int(self.tap_y, 0))
+        self.tap_ms = max(0, _to_int(self.tap_ms, 80))
+        self.modules = modules_to_payload(normalize_modules(self.modules, strict=False))
+        self.output_fields = normalize_output_fields(self.output_fields)
+        self.display_mode = str(self.display_mode or "off").strip().lower()
+        if self.display_mode not in ("off", "wide"):
+            self.display_mode = "off"
+        self.display_scale = max(1.0, min(4.0, _to_float(self.display_scale, 2.0)))
+        self.display_width_scale = max(
+            1.0, min(2.5, _to_float(self.display_width_scale, 1.0))
+        )
+        self.display_density = max(0, _to_int(self.display_density, 0))
+        self.display_scaling = str(self.display_scaling or "auto").strip().lower()
+        if self.display_scaling not in ("auto", "off"):
+            self.display_scaling = "auto"
         self.textbook = str(self.textbook or "").strip()
         self.chapter = str(self.chapter or "").strip()
         self.output_dir = str(self.output_dir or "").strip()
@@ -364,8 +429,40 @@ class AppConfig:
             errors.append(
                 "未找到 API Key，请在 .env 中配置 SILICONFLOW_API_KEY_1 / _2 …"
             )
+        try:
+            normalize_modules(self.modules, strict=True)
+        except ConfigError as exc:
+            errors.append(f"提取模块配置有误：{exc}")
+        if self.display_mode == "wide" and not self.uses_display_override:
+            # 倍数 1.0 是允许的（只改密度 / 只加宽），但总得改点什么，否则这次设置没有意义
+            errors.append(
+                "显示设置要么把倍数设成 > 1（例如 --display-scale 2.0）、"
+                "要么加宽（--display-width-scale 1.2）、"
+                "要么设一个密度（例如 --display-density 420，只把字变小）"
+            )
         if errors:
             raise ConfigError("；".join(errors))
+
+    @property
+    def modules_specs(self) -> list[ModuleSpec]:
+        """提取模块清单（归一化后的对象形式）。"""
+        return normalize_modules(self.modules, strict=False)
+
+    @property
+    def output_field_map(self) -> dict[str, dict[str, Any]]:
+        """本体字段 -> {in_json, in_markdown}（见 modules.BASE_FIELDS）。"""
+        return output_field_map(self.output_fields)
+
+    @property
+    def uses_display_override(self) -> bool:
+        """这次运行是否需要临时改手机显示设置（加长 / 加宽 / 只把密度调小）。"""
+        if self.display_mode != "wide":
+            return False
+        return (
+            self.display_scale > 1
+            or self.display_width_scale > 1.0
+            or self.display_density > 0
+        )
 
     @property
     def effective_request_deadline(self) -> float:
@@ -579,5 +676,14 @@ def load_config_with_fallback(path: str | os.PathLike[str] | None = None) -> tup
         candidates.append(legacy_config_path())
     for candidate in candidates:
         if candidate.is_file():
-            return AppConfig.from_dict(load_config_file(candidate)), str(candidate)
+            return _migrate_defaults(AppConfig.from_dict(load_config_file(candidate))), str(candidate)
     return AppConfig(), None
+
+
+def _migrate_defaults(config: AppConfig) -> AppConfig:
+    """把配置里「从没改过的老默认值」跟着新版默认走。"""
+    if config.model == LEGACY_DEFAULT_MODEL:
+        config.model = DEFAULT_MODEL
+    if config.base_url == LEGACY_DEFAULT_BASE_URL:
+        config.base_url = DEFAULT_BASE_URL
+    return config

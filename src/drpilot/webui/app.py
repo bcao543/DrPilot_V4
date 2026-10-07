@@ -12,6 +12,15 @@ from .bridge import UiBridge
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 INDEX = ASSETS / "index.html"
+# 主界面只留「任务范围 / 手机连接 / 识别与输出」三张卡 + 日志，
+# 其余四块设置各开一个独立窗口（点主界面的入口卡片打开）
+PAGES = {
+    "main": INDEX,
+    "tuner": ASSETS / "tuner.html",
+    "actions": ASSETS / "actions.html",
+    "modules": ASSETS / "modules.html",
+    "model": ASSETS / "model.html",
+}
 
 
 def _folder_dialog_type(webview: Any) -> Any:
@@ -23,7 +32,12 @@ def _folder_dialog_type(webview: Any) -> Any:
     return getattr(webview, "FOLDER_DIALOG", 20)
 
 
-def run_web_ui(config_path: str | None = None, width: int = 1180, height: int = 920) -> int:
+def run_web_ui(
+    config_path: str | None = None,
+    width: int = 1180,
+    height: int = 920,
+    logger: Any = None,
+) -> int:
     """打开图形界面；返回进程退出码。"""
     try:
         import webview
@@ -58,7 +72,29 @@ def run_web_ui(config_path: str | None = None, width: int = 1180, height: int = 
         if window is not None:
             window.destroy()
 
-    bridge = UiBridge(config_path=config_path, pick_directory=pick_directory, on_exit=request_exit)
+    def open_window(title: str, page: str, api: Any, width: int, height: int) -> Any:
+        """开一个入口窗口（翻页动作 / 提取模块 / 模型服务 / 屏幕调节）。pywebview 6 允许在 GUI 跑起来之后这么开：
+        js_api 的调用本身就在子线程里，所以 create_window 会立刻生效。"""
+        path = PAGES.get(page, INDEX)
+        return webview.create_window(
+            title,
+            url=str(path),
+            js_api=api,
+            width=width,
+            height=height,
+            min_size=(760, 560),
+            background_color="#e7eaf1",
+            text_select=False,
+        )
+
+    bridge = UiBridge(
+        config_path=config_path,
+        pick_directory=pick_directory,
+        on_exit=request_exit,
+        open_window=open_window,
+        # cli 传进来的 RunLogger：图形界面的日志同时写进 logs/drpilot-*.log
+        run_logger=logger,
+    )
     # 注意：这里传「本地路径」而不是 file:// —— pywebview 会自动起一个本地 http 服务
     # （http://127.0.0.1:port/…）。同源页面才能用 canvas 读像素，点阵马背景才画得出来；
     # 用 file:// 的话 getImageData 会被判定为跨域而报 SecurityError。

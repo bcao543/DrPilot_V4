@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -36,11 +37,14 @@ from ..actions import (
 from ..adb import AdbClient, format_devices, normalize_address
 from ..ai import ModelCheckResult, check_model_connection
 from ..config import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
     DEFAULT_SWIPE_DURATION_MS,
     DEFAULT_SWIPE_END_X,
     DEFAULT_SWIPE_END_Y,
     DEFAULT_SWIPE_START_X,
     DEFAULT_SWIPE_START_Y,
+    PAGE_ACTIONS,
     AppConfig,
     build_swipe_plan,
     default_config_path,
@@ -51,7 +55,9 @@ from ..config import (
     resolve_output_paths,
     save_config_file,
 )
+from ..display import ApplyResult, DisplayController
 from ..errors import AdbError, ConfigError
+from ..images import image_size, to_thumb_data_url
 from ..keys import (
     append_api_keys,
     clear_api_keys,
@@ -62,11 +68,36 @@ from ..keys import (
     remove_api_key,
     save_api_keys,
 )
+from ..modules import (
+    BASE_FIELDS,
+    MAX_MODULES,
+    PRESETS,
+    default_output_fields,
+    modules_to_payload,
+    normalize_modules,
+    normalize_output_fields,
+    output_fields_summary,
+)
 from ..pipeline import PilotSession
+from .panels import ActionPanelApi, ModelPanelApi, ModulePanelApi
+from .tuner import DisplayTunerApi
 
 DEFAULT_DEVICE_PORT = "5555"
 MAX_LOG_BUFFER = 4000
 NOT_SET_ACTION_NOTE = "未设置：将使用下方手动滑动坐标"
+
+# 主界面的「入口」：点一下开一个独立窗口。
+# page 是逻辑名（app.py 的 PAGES 负责映射到 html 文件），不归桥管。
+# 窗口尺寸按各自内容量给：够用就好，别让卡片下面留一大片空白
+PANEL_PAGES: dict[str, dict[str, Any]] = {
+    "action": {"title": "DrPilot · 翻页动作", "page": "actions", "width": 1060, "height": 620},
+    "modules": {"title": "DrPilot · 提取模块", "page": "modules", "width": 1100, "height": 780},
+    "model": {"title": "DrPilot · 模型服务", "page": "model", "width": 900, "height": 560},
+    "tuner": {"title": "DrPilot · 屏幕调节", "page": "tuner", "width": 1180, "height": 820},
+}
+PANEL_LABELS = {
+    "action": "翻页动作", "modules": "提取模块", "model": "模型服务", "tuner": "屏幕调节",
+}
 
 
 def log_tone(message: str) -> str:
@@ -110,6 +141,58 @@ def _as_float(
         raise ConfigError(f"{name} 必须是数字") from exc
 
 
+def _as_bool(payload: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    """读勾选框：前端 FLAGS 传的是布尔，也容忍 "1"/"true"/"off" 这类字符串。"""
+    value = (payload or {}).get(key)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return default
+        return text not in ("0", "false", "no", "off", "none", "null")
+    return bool(value)
+
+
+def modules_from_payload(payload: Mapping[str, Any] | None) -> list[Any]:
+    """extract_modules（hidden input）-> 归一化后的模块清单。
+
+    前端存的是 JSON 字符串（抄 next_action 的做法）；这里先 json.loads 再交给
+    normalize_modules(strict=True)，写错名字/重复/与固定字段撞名都会抛 ConfigError，
+    由前端 toast 出来，绝不悄悄丢掉用户的模块。
+    """
+    raw = _text(payload or {}, "extract_modules")
+    if not raw:
+        return []
+    value: Any = raw
+    if raw.lstrip()[:1] in ("[", "{"):
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            raise ConfigError(f"模块清单不是合法 JSON：{exc}") from exc
+    return normalize_modules(value, strict=True)
+
+
+def display_fields_from_payload(data: Mapping[str, Any]) -> tuple[str, str]:
+    """payload -> ("off"|"wide", "auto"|"off")。
+
+    GUI 的倍数滑块决定 display_mode（1.0 = off，由 app.js 的 payload() 算好传过来），
+    display_scaling 是界面上的隐藏开关；_config_dict() 回填的是布尔（check 状态），
+    这里也兼容直接传 "wide"/"off" 字符串。
+    """
+    raw_mode = data.get("display_mode")
+    if isinstance(raw_mode, str) and raw_mode.strip().lower() in ("off", "wide"):
+        mode = raw_mode.strip().lower()
+    else:
+        mode = "wide" if _as_bool(data, "display_mode") else "off"
+    raw_scaling = data.get("display_scaling")
+    if isinstance(raw_scaling, str) and raw_scaling.strip().lower() in ("auto", "off"):
+        scaling = raw_scaling.strip().lower()
+    else:
+        scaling = "off" if _as_bool(data, "display_scaling") else "auto"
+    return mode, scaling
+
+
 def config_from_payload(
     payload: Mapping[str, Any] | None, require_output: bool = True
 ) -> AppConfig:
@@ -130,21 +213,21 @@ def config_from_payload(
 
     ip = _text(data, "device_ip")
     port = _text(data, "device_port") or DEFAULT_DEVICE_PORT
+    modules = modules_from_payload(data)
+    display_mode, display_scaling = display_fields_from_payload(data)
 
+    # 翻页动作：next_action 只放「录制的动作」；手动点按坐标单独存 tap_*，
+    # 由 page_action 决定这次用哪一种（auto = 旧的优先级）
     steps = payload_to_steps(_text(data, "next_action"))
-    if not steps:
-        tap_x = _as_int(data, "action_tap_x", "手动点按 X")
-        tap_y = _as_int(data, "action_tap_y", "手动点按 Y")
-        if tap_x > 0 and tap_y > 0:
-            steps = [
-                Step(
-                    kind="tap",
-                    x=tap_x,
-                    y=tap_y,
-                    duration_ms=_as_int(data, "action_tap_ms", "手动点按按住时长", 80),
-                    absolute=True,
-                )
-            ]
+    page_action = _text(data, "page_action").lower() or "auto"
+    if page_action not in PAGE_ACTIONS:
+        page_action = "auto"
+    tap_x = _as_int(data, "action_tap_x", "手动点按 X")
+    tap_y = _as_int(data, "action_tap_y", "手动点按 Y")
+    tap_ms = _as_int(data, "action_tap_ms", "手动点按按住时长", 80)
+    # 本体字段开关：主界面 hidden input 里是 JSON 字符串；空 = 没配过（用默认三件套）
+    raw_fields = data.get("output_fields")
+    output_fields = None if raw_fields in (None, "") else normalize_output_fields(raw_fields)
 
     config = AppConfig(
         page_from=_as_int(data, "page_from", "起始题号", 1),
@@ -176,6 +259,18 @@ def config_from_payload(
         retry_wait=_as_float(data, "swipe_retry_wait", "重试前等待", 1.2),
         swipe_reference_width=(reference[0] if reference else 0),
         swipe_reference_height=(reference[1] if reference else 0),
+        max_tokens=_as_int(data, "max_tokens", "最大 token", 4096),
+        modules=modules_to_payload(modules),
+        output_fields=output_fields if output_fields is not None else default_output_fields(),
+        page_action=page_action,
+        tap_x=tap_x,
+        tap_y=tap_y,
+        tap_ms=tap_ms,
+        display_mode=display_mode,
+        display_scale=_as_float(data, "display_scale", "加长倍数", 2.0),
+        display_width_scale=_as_float(data, "display_width_scale", "加宽倍数", 1.0),
+        display_density=_as_int(data, "display_density", "显示密度", 0),
+        display_scaling=display_scaling,
         next_action=steps_to_payload(steps),
         device_address=f"{ip}:{port}" if ip else "",
     )
@@ -205,14 +300,20 @@ class UiBridge:
         model_checker: Callable[..., ModelCheckResult] | None = None,
         adb_factory: Callable[..., Any] | None = None,
         env_path: str | None = None,
+        open_window: Callable[..., Any] | None = None,
+        run_logger: Any = None,
     ) -> None:
         self.config_path = config_path
+        # 由 cli 注入：图形界面的运行日志同步写进 logs/drpilot-*.log
+        self._run_logger = run_logger
         # 默认写项目根 .env；测试/多实例可注入临时路径，避免碰真实 .env
         self.env_path = str(env_path) if env_path else None
         self._pick_directory = pick_directory or (lambda initial: None)
         self._on_exit = on_exit or (lambda: None)
         self._model_checker = model_checker or check_model_connection
         self._adb_factory = adb_factory or AdbClient
+        # 由 app.py 注入：开一个 pywebview 子窗口（page 是逻辑名，路径不归桥管）
+        self._window_factory = open_window
 
         self._lock = threading.RLock()
         self._logs: deque[dict[str, str]] = deque(maxlen=MAX_LOG_BUFFER)
@@ -242,6 +343,22 @@ class UiBridge:
                 "reference": "",
                 "note": NOT_SET_ACTION_NOTE,
             },
+            # 手机显示状态（加长主屏）：text/tone/detail 给界面那一行用，
+            # has_override/state 是 display_status() 的即时返回值，capture 存最近一次预览结果
+            "display": {
+                "text": "显示：未读取（点「复位显示」或拖一下倍数会读取手机设置）",
+                "tone": "muted",
+                "detail": "",
+                "has_override": False,
+                "state": {},
+                "capture": {},
+                # 缩略图不放进 150ms 的状态轮询里：这里只报版本号，图由 pop_display_thumb 取一次
+                "thumb_seq": 0,
+                # 「原本」那张图（屏幕调节窗口左侧）同理：只报版本号，图由 pop_original 取一次
+                "original_seq": 0,
+            },
+            # 当前模块清单的纯数据（写法同 key_items），前端据此渲染模块列表
+            "modules": [],
         }
         self._config = AppConfig()
         self._session: PilotSession | None = None
@@ -252,12 +369,42 @@ class UiBridge:
         self._question_seq = 0
         self._record_stop = threading.Event()
         self._record_thread: threading.Thread | None = None
+        # 实时屏幕调节（滑块）：同一时刻只跑一次「设置手机显示」，中间值直接丢掉
+        self._display_lock = threading.Lock()
+        self._display_seq = 0
+        self._display_want: tuple[AppConfig, int, bool] | None = None
+        self._display_worker: threading.Thread | None = None
+        self._display_holder: DisplayController | None = None   # 界面上实时加长时握着，退出/开跑前复位
+        self._display_thumb = ""
+        self._display_closing = False
+        # 入口窗口：action / modules / model / tuner 各一个，主界面只留入口按钮
+        self._windows: dict[str, Any] = {}
+        # 主界面当前表单的快照（preview() 每次都会带过来），窗口拿它当基准
+        self._form_snapshot: dict[str, Any] = {}
+        # 各窗口自己改过、还没被主界面回填的值
+        self._panel_state: dict[str, dict[str, Any]] = {}
+        # 各窗口底部的状态条文案（试一次 / 录制 / 测模型的结果）
+        self._panel_status: dict[str, dict[str, str]] = {}
+        # 「屏幕调节」窗口（tuner）用：最近一次「请求的尺寸 vs 手机实际接受的尺寸」
+        self._tuner_request: dict[str, Any] = {}
+        self._tuner_payload_data: dict[str, Any] = {}
+        self._tuner_config = AppConfig()
+        self._tuner_original: dict[str, Any] | None = None
 
     # ---------------- 状态工具 ----------------
     def _log(self, message: str, tone: str | None = None) -> None:
-        line = {"text": str(message), "tone": tone if tone is not None else log_tone(message)}
+        text = str(message)
+        line = {"text": text, "tone": tone if tone is not None else log_tone(message)}
         with self._lock:
             self._logs.append(line)
+        # 图形界面也要留一份日志文件：出问题时用户能直接把 logs/*.log 发出来
+        # （以前 GUI 的日志只存在界面面板里，关掉窗口就没了）
+        if self._run_logger is not None:
+            level = "ERROR" if line["tone"] == "err" else ("WARN" if line["tone"] == "warn" else "INFO")
+            try:
+                self._run_logger.log(text, level=level)
+            except Exception:
+                pass
 
     def _toast(self, text: str, tone: str = "") -> None:
         with self._lock:
@@ -311,11 +458,109 @@ class UiBridge:
             fields["note"] = note
         self._update("model", **fields)
 
+    def _set_display(self, text: str, tone: str = "muted", detail: str | None = None,
+                     **fields: Any) -> None:
+        payload: dict[str, Any] = {"text": str(text), "tone": str(tone)}
+        if detail is not None:
+            payload["detail"] = str(detail)
+        payload.update(fields)
+        self._update("display", **payload)
+
+    def _display_snapshot(self) -> dict[str, Any]:
+        """display_status() 的即时返回：缓存值，后台线程随后刷新。"""
+        with self._lock:
+            display = copy.deepcopy(self._state.get("display") or {})
+        return {
+            "ok": True,
+            "text": str(display.get("text") or ""),
+            "tone": str(display.get("tone") or ""),
+            "detail": str(display.get("detail") or ""),
+            "has_override": bool(display.get("has_override")),
+            "state": display.get("state") or {},
+            # 最近一次截图的结果（image/size/display），方便前端复核
+            "capture": display.get("capture") or {},
+            "thumb_seq": int(display.get("thumb_seq") or 0),
+        }
+
+    def _sync_modules_state(self, modules: Any = None) -> None:
+        """把当前模块清单同步给前端（纯数据，直接 deepcopy 保证 JSON 可序列化）。"""
+        data = self._config.modules if modules is None else modules
+        self._set_flag("modules", copy.deepcopy(list(data or [])))
+
+    def _sync_display_config_state(self) -> None:
+        """还没读过真机时，先用配置里的设置把状态栏填上（不覆盖真机读到的结果）。"""
+        with self._lock:
+            display = self._state.get("display") or {}
+            if display.get("state"):
+                return
+        config = self._config
+        if config.uses_display_override:
+            if config.display_scale > 1:
+                text = f"显示：已启用加长主屏（{config.display_scale} 倍）"
+                if config.display_width_scale > 1.0:
+                    text += f"，加宽 {config.display_width_scale} 倍"
+                if config.display_density:
+                    text += f"，密度 {config.display_density}"
+            elif config.display_width_scale > 1.0:
+                text = f"显示：只加宽逻辑屏（{config.display_width_scale} 倍）"
+                if config.display_density:
+                    text += f"，密度 {config.display_density}"
+            else:
+                text = f"显示：只改显示密度（{config.display_density}）"
+            if config.display_scaling == "off":
+                text += "，物理屏 1:1 裁剪"
+            tone = "info"
+        else:
+            text, tone = "显示：未启用加长主屏", "muted"
+        self._set_display(
+            text, tone,
+            detail="手机当前显示设置尚未读取；点「预览加长屏截图」或「复位」会读取真机状态",
+        )
+
+    def _remember_form(self, payload: Mapping[str, Any] | None) -> None:
+        """记住主界面当前表单的快照：入口窗口要用它当基准（设备地址、输出目录…）。"""
+        if isinstance(payload, Mapping) and payload:
+            self._form_snapshot = dict(payload)
+
+    def panel_summaries(self) -> dict[str, str]:
+        """主界面四个入口卡片上的一行摘要（每次轮询都会带过去）。"""
+        panel = self._panel_state.get("modules") or {}
+        items = panel.get("fields")
+        if items is None:
+            items = self._unified_fields()
+        with self._lock:
+            display = copy.deepcopy(self._state.get("display") or {})
+        return {
+            "action": self.action_summary(),
+            "modules": self.modules_summary_text(items),
+            "model": self.model_summary(),
+            "display": str(display.get("text") or "显示：未读取"),
+        }
+
+    def panel_payload(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """入口窗口用的完整 payload：主界面表单 < 窗口自己改过的值 < 本次传入的值。"""
+        data = dict(self._config_dict())
+        data.update(self._form_snapshot)
+        data.update({key: value for key, value in (values or {}).items() if value is not None})
+        return data
+
+    def _panel_note(self, name: str, text: str, tone: str = "") -> None:
+        """给某个入口窗口记一条状态文案（窗口轮询时显示在底部）。"""
+        with self._lock:
+            self._panel_status[str(name)] = {"text": str(text), "tone": str(tone)}
+
+    def _panel_notice(self, name: str) -> dict[str, str]:
+        with self._lock:
+            item = dict(self._panel_status.get(str(name)) or {})
+        return {"text": str(item.get("text") or ""), "tone": str(item.get("tone") or "")}
+
     def _snapshot(self) -> dict[str, Any]:
         with self._lock:
             state = copy.deepcopy(self._state)
         state["toasts"] = self._take_toasts()
         state["form_patch"] = self._take_form_patch()
+        # 主界面入口卡片的一行摘要（翻页动作 / 提取模块 / 模型服务 / 屏幕调节）
+        state["panels"] = self.panel_summaries()
         return state
 
     # ---------------- 提问 ----------------
@@ -380,9 +625,25 @@ class UiBridge:
             "next_action": (
                 json.dumps(config.next_action, ensure_ascii=False) if config.next_action else ""
             ),
-            "action_tap_x": "",
-            "action_tap_y": "",
-            "action_tap_ms": 80,
+            # 模块清单：抄 next_action 的做法，前端用 hidden input 存 JSON 字符串
+            "extract_modules": (
+                json.dumps(config.modules, ensure_ascii=False) if config.modules else ""
+            ),
+            "display_scale": config.display_scale,
+            "display_width_scale": config.display_width_scale,
+            "display_density": config.display_density,
+            "max_tokens": config.max_tokens,
+            # 布尔回填：app.js 把 display_scale>1 当作 display_mode、隐藏开关当 display_scaling，
+            # 不是 "wide"/"off" 字符串
+            "display_mode": config.display_mode == "wide",
+            "display_scaling": config.display_scaling == "off",
+            # 翻页动作：选中哪一种 + 手动点按坐标（空坐标回填成空串，输入框才是空的）
+            "page_action": config.page_action,
+            "action_tap_x": config.tap_x or "",
+            "action_tap_y": config.tap_y or "",
+            "action_tap_ms": config.tap_ms,
+            # 本体字段开关：前端用 hidden input 存 JSON 字符串；"[]" = 三个都别写
+            "output_fields": json.dumps(config.output_fields or [], ensure_ascii=False),
             "device_ip": "",
             "device_port": DEFAULT_DEVICE_PORT,
         } | self._device_fields()
@@ -401,6 +662,8 @@ class UiBridge:
             self._log(f"读取配置失败：{exc}", "err")
             return
         self._config = config
+        self._sync_modules_state()
+        self._sync_display_config_state()
         if path:
             self._log(f"已加载配置：{path}")
 
@@ -591,6 +854,8 @@ class UiBridge:
         return {"logs": self._take_logs(), "state": self._snapshot()}
 
     def preview(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+        # 顺手记住这份表单：入口窗口打开时不必再问一次主界面
+        self._remember_form(payload)
         return self._refresh_preview(payload or {})
 
     def _refresh_preview(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -734,6 +999,8 @@ class UiBridge:
             if result.suggestions:
                 note += f"　相似模型：{'、'.join(result.suggestions)}"
             self._set_model("模型：不可用", "danger", note=note)
+        # 「模型服务」窗口底部的状态条
+        self._panel_note("model", note, "ok" if result.ok else "err")
         self._log(result.summary())
         if not result.ok and result.hint():
             self._log(f"提示：{result.hint()}", "warn")
@@ -763,6 +1030,8 @@ class UiBridge:
             return {"ok": False, "error": str(exc)}
 
         self._config = config
+        self._sync_modules_state()
+        self._sync_display_config_state()
         self._refresh_key_info()
         self._save_config(config)
         self._reset_run_state()
@@ -778,9 +1047,20 @@ class UiBridge:
             on_model_check=self._confirm_model,
         )
         self._session = session
-        self._run_thread = threading.Thread(target=session.run, name="drpilot-run", daemon=True)
+        self._run_thread = threading.Thread(
+            target=self._run_session, args=(session,), name="drpilot-run", daemon=True
+        )
         self._run_thread.start()
         return {"ok": True}
+
+    def _run_session(self, session: PilotSession) -> None:
+        """开跑前把「界面实时加长」的屏幕交还给管线（跑完由管线负责复位）。"""
+        if self._config.uses_display_override:
+            with self._display_lock:
+                self._display_holder = None    # 这次运行本来就要加长：交给管线，别再复位一遍
+        else:
+            self._release_display_holder(reason="开始提取：先把界面实时预览的显示设置复位")
+        session.run()
 
     def stop(self) -> dict[str, Any]:
         """停止运行；重复点击只生效一次。"""
@@ -880,6 +1160,10 @@ class UiBridge:
         text = f"{size[0]}x{size[1]}"
         self._log(f"滑动基准分辨率已设为当前设备：{text}")
         self._toast(f"基准分辨率：{text}", "ok")
+        with self._lock:
+            panel = dict(self._panel_state.get("action") or {})
+            panel["reference"] = text
+            self._panel_state["action"] = panel
         self._patch_form(swipe_reference=text)
 
     def test_swipe(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -951,6 +1235,7 @@ class UiBridge:
             self._toast(str(exc), "err")
             return {"ok": False, "error": str(exc)}
         self._record_stop.clear()
+        self._panel_note("action", "录制中…请在手机上完成一次「下一题」动作", "info")
         self._set_recording(
             True,
             steps=[],
@@ -1001,6 +1286,7 @@ class UiBridge:
         if result is None:
             return
         if result.error:
+            self._panel_note("action", f"录制失败：{result.error}", "err")
             self._log(f"录制失败：{result.error}", "err")
             self._toast(f"录制失败：{result.error[:80]}", "err")
             self._update("action", note=result.error)
@@ -1023,6 +1309,7 @@ class UiBridge:
             self._log(result.note, "warn")
         if reference:
             self._log(f"录制分辨率已写为基准分辨率：{reference}")
+        self._panel_note("action", f"录制完成（{len(result.steps)} 步），可以点「试一次」验证", "ok")
         self._toast("录制完成，可以点「试一次」验证", "ok")
         self._log("提示：录制/试动作会让手机前进一题，开始提取前请把手机切回起始题")
 
@@ -1040,6 +1327,7 @@ class UiBridge:
         if not steps:
             self._toast("请先录制翻页动作，或填写手动点按/滑动坐标", "err")
             return {"ok": False, "error": "没有翻页动作"}
+        self._panel_note("action", "正在试一次翻页动作（对比前后截图）…", "info")
         self._log("正在试一次翻页动作（对比前后截图）…")
         threading.Thread(
             target=self._do_test_action, args=(config,), name="drpilot-test-action", daemon=True
@@ -1066,9 +1354,11 @@ class UiBridge:
             after = adb.screenshot()
             changed = hashlib.md5(before).hexdigest() != hashlib.md5(after).hexdigest()
             if changed:
+                self._panel_note("action", "翻页动作生效：画面已变化 ✓", "ok")
                 self._log(f"翻页动作生效：画面已变化 ✓　{plan.describe()}", "ok")
                 self._toast("翻页动作生效：画面已变化 ✓", "ok")
             else:
+                self._panel_note("action", "翻页动作后画面没有变化 ✗（动作可能不对，或已在最后一题）", "warn")
                 self._log(
                     "翻页动作后画面没有变化 ✗（动作可能不对，或已在最后一题）"
                     f"　{plan.describe()}",
@@ -1081,13 +1371,15 @@ class UiBridge:
         self._log("提示：录制/试动作会让手机前进一题，开始提取前请把手机切回起始题")
 
     def clear_action(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        self._update("action", steps=[], summary="", reference="", note=NOT_SET_ACTION_NOTE)
-        self._patch_form(next_action="")
-        self._log("已清除翻页动作，将使用下方手动滑动坐标")
-        return {"ok": True}
+        """清除录制的翻页动作（点按 / 滑动参数不动）。"""
+        return self.clear_recorded()
 
     def use_tap(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
-        """手动点按兜底：设备不支持录制时也能适配点击类 App。"""
+        """手动点按兜底：设备不支持录制时也能适配点击类 App。
+
+        新版把点按坐标单独存进 tap_x / tap_y / tap_ms，并把翻页方式切成「点按」；
+        不再塞进 next_action（那是录制动作专用，免得互相覆盖）。
+        """
         data: Mapping[str, Any] = payload or {}
         try:
             x = _as_int(data, "action_tap_x", "手动点按 X")
@@ -1099,14 +1391,929 @@ class UiBridge:
         if x <= 0 or y <= 0:
             self._toast("请先填写点按 X / Y（屏幕像素坐标）", "err")
             return {"ok": False, "error": "缺少坐标"}
-        step = Step(kind="tap", x=x, y=y, duration_ms=max(0, duration), absolute=True)
-        payload_steps = steps_to_payload([step])
-        self._update(
-            "action", steps=payload_steps, summary=steps_summary([step]), note="手动点按"
+        saved = self.save_action_settings(
+            {"kind": "tap", "tap": {"x": x, "y": y, "ms": max(0, duration)}}
         )
-        self._patch_form(next_action=json.dumps(payload_steps, ensure_ascii=False))
+        if saved.get("ok") is False:
+            self._toast(str(saved.get("error") or "设置失败"), "err")
+            return saved
+        step = Step(kind="tap", x=x, y=y, duration_ms=max(0, duration), absolute=True)
         self._log(f"已设置手动点按：{step.describe()}", "ok")
         return {"ok": True}
+
+    # ---------------- 提取模块 / 加长主屏 ----------------
+    def list_module_presets(self) -> dict[str, Any]:
+        """内置模块目录 + 当前清单；前端用来画「常用模块」快捷按钮。
+
+        纯数据、立即返回：不碰设备，不需要后台线程。
+        """
+        with self._lock:
+            current = copy.deepcopy(self._state.get("modules") or [])
+        if not current:
+            current = copy.deepcopy(self._config.modules)
+        return {"presets": [spec.to_dict() for spec in PRESETS], "current": current}
+
+    def _resolve_address(self, payload: Mapping[str, Any] | None) -> str:
+        """优先用表单里填的 IP，其次用配置里已保存的设备地址。"""
+        try:
+            return address_from_payload(payload)
+        except AdbError:
+            return self._config.device_address or ""
+
+    def _open_adb(self, address: str = "", *, timeout: float = 20.0) -> Any:
+        """造一个 adb 客户端并确保有设备（和 _do_test_swipe 同一套写法）。"""
+        adb = self._adb_factory(
+            adb_path=self._config.adb_path, serial=self._config.serial, timeout=timeout
+        )
+        if address:
+            try:
+                adb.connect(address, timeout=timeout)
+            except Exception as exc:
+                self._log(f"无线连接失败（改用已连接的设备）：{describe_exception(exc)}", "warn")
+        adb.ensure_device()
+        return adb
+
+    def display_status(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """读手机当前显示设置：立即返回缓存值（text/has_override/state），后台线程去真机刷新。"""
+        address = self._resolve_address(payload)
+        threading.Thread(
+            target=self._do_read_display, args=(address,), name="drpilot-display-status", daemon=True
+        ).start()
+        return self._display_snapshot()
+
+    def _do_read_display(self, address: str) -> None:
+        try:
+            adb = self._open_adb(address)
+            state = DisplayController(adb, log=self._log).read_state()
+        except Exception as exc:
+            detail = describe_exception(exc)
+            self._log(f"读取手机显示设置失败：{detail}", "err")
+            self._set_display("显示：读取失败", "danger", detail=detail, has_override=False, state={})
+            self._toast(f"读取显示设置失败：{describe_exception(exc, 80)}", "err")
+            return
+        text = state.describe()
+        if state.has_override:
+            self._set_display(
+                f"显示：已有覆盖（{text}）", "warning", detail=text,
+                has_override=True, state=state.as_dict(),
+            )
+            self._log(f"手机当前显示：{text}（可点「复位」恢复）", "warn")
+            self._toast("手机上已有显示覆盖：识别完记得点「复位」", "warn")
+        else:
+            self._set_display(
+                f"显示：{text}", "success", detail=text,
+                has_override=False, state=state.as_dict(),
+            )
+            self._log(f"手机当前显示：{text}")
+
+    def reset_display(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """复位手机的 wm size / density / scaling：立即返回，后台线程干活。"""
+        address = self._resolve_address(payload)
+        self._set_display("显示：正在复位…", "info")
+        self._log("正在复位手机显示设置（wm size / density / scaling）…")
+        threading.Thread(
+            target=self._do_reset_display, args=(address,), name="drpilot-display-reset", daemon=True
+        ).start()
+        return {"ok": True, "text": "正在复位显示设置…"}
+
+    def _do_reset_display(self, address: str) -> None:
+        try:
+            adb = self._open_adb(address)
+            state = DisplayController(adb, log=self._log).reset_all()
+        except Exception as exc:
+            detail = describe_exception(exc)
+            self._log(f"复位显示设置失败：{detail}", "err")
+            self._set_display("显示：复位失败", "danger", detail=detail, has_override=False, state={})
+            self._toast(f"复位显示设置失败：{describe_exception(exc, 80)}", "err")
+            return
+        text = state.describe()
+        if state.has_override:
+            self._set_display(
+                f"显示：可能没复位干净（{text}）", "warning", detail=text,
+                has_override=True, state=state.as_dict(),
+            )
+            self._log(f"[警告] 显示设置可能没复位干净（{text}）：请再点一次「复位」", "warn")
+            self._toast("显示设置可能没复位干净，请再点一次「复位」", "warn")
+        else:
+            self._set_display(
+                f"显示：已复位（{text}）", "success", detail=text,
+                has_override=False, state=state.as_dict(),
+            )
+            self._log(f"已复位手机显示设置：{text}", "ok")
+            self._toast("已复位手机显示设置", "ok")
+
+    def preview_capture(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+        """抓全尺寸截图：立即返回，后台线程确保屏幕已按当前设置就绪 → 截图 → 打开 PNG。
+
+        **不复位手机**：和滑块共用同一块屏幕（同一套设置时直接确认，不会重排版），
+        要还原点「复位显示」或退出程序。返回的是「上一次截图」的结果（首次调用时
+        image/size 为空串）——真正的结果随后写进 state.display.capture
+        （display_status() 也会一并带出来），界面靠轮询拿，这样点按钮不会卡住 UI。
+        """
+        try:
+            config = config_from_payload(payload, require_output=False)
+        except ConfigError as exc:
+            self._toast(str(exc), "err")
+            return {"ok": False, "error": str(exc)}
+        with self._lock:
+            last = dict((self._state.get("display") or {}).get("capture") or {})
+        if config.display_scale > 1:
+            detail = f"{config.display_scale} 倍"
+            if config.display_density:
+                detail += f"，密度 {config.display_density}"
+        elif config.display_density:
+            detail = f"只改密度 {config.display_density}"
+        else:
+            detail = "原始分辨率"
+        if config.display_scaling == "off":
+            detail += "，物理屏 1:1 裁剪"
+        self._set_display("显示：正在抓全尺寸截图…", "info")
+        self._log(f"正在抓全尺寸截图：{detail}（手机保持当前设置，不复位）")
+        threading.Thread(
+            target=self._do_preview_capture, args=(config,),
+            name="drpilot-preview-capture", daemon=True,
+        ).start()
+        # 立刻返回上一次的截图信息（首次为空），真正的结果随后进 state.display.capture
+        return {
+            "ok": True,
+            "text": "正在抓全尺寸截图…",
+            "image": str(last.get("image") or ""),
+            "size": str(last.get("size") or ""),
+            "display": last.get("display") or {},
+        }
+
+    def _do_preview_capture(self, config: AppConfig) -> None:
+        try:
+            adb = self._open_adb(config.device_address or "", timeout=30.0)
+            controller = DisplayController(adb, log=self._log)
+            result: ApplyResult | None = None
+            if config.uses_display_override:
+                result = controller.apply(
+                    scale=config.display_scale,
+                    width_scale=config.display_width_scale,
+                    density=config.display_density,
+                    scaling=config.display_scaling,
+                    screenshot=getattr(adb, "screenshot", None),
+                )
+                self._log(result.describe())
+                if result.verified:
+                    with self._display_lock:
+                        if not self._display_closing:
+                            # 这块屏幕由界面负责还原（复位按钮 / 退出程序），抓图不动它
+                            self._display_holder = controller
+                    state = controller.read_state()
+                    self._update(
+                        "display", state=state.as_dict(), has_override=state.has_override
+                    )
+                else:
+                    self._toast(result.note or "显示设置没生效，按原尺寸截图", "warn")
+            self._update_display_thumb(adb, result, open_it=True)
+        except Exception as exc:
+            detail = describe_exception(exc)
+            self._log(f"抓全尺寸截图失败：{detail}", "err")
+            self._set_display("显示：抓图失败", "danger", detail=detail)
+            self._toast(f"抓全尺寸截图失败：{describe_exception(exc, 80)}", "err")
+
+    # ---------------- 实时调节手机显示（界面上的倍数 / 密度滑块） ----------------
+    def apply_display(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """按当前滑块的倍数/密度立刻改手机显示，**不自动复位**（方便盯着手机调）。
+
+        倍数为 1.0 就是关闭加长，会顺手把显示设置复位。设置与截图都在后台线程里做，
+        这里立刻返回；拖动过程中的中间值会被丢掉，只有最后一次生效。
+        """
+        try:
+            config = config_from_payload(payload, require_output=False)
+        except ConfigError as exc:
+            self._toast(str(exc), "err")
+            return {"ok": False, "error": str(exc)}
+        preview = _as_bool(payload or {}, "display_preview", True)
+        with self._display_lock:
+            self._display_seq += 1
+            self._display_want = (config, self._display_seq, preview)
+            if self._display_worker is None or not self._display_worker.is_alive():
+                self._display_worker = threading.Thread(
+                    target=self._display_loop, name="drpilot-display-apply", daemon=True
+                )
+                self._display_worker.start()
+        return {"ok": True}
+
+    def _display_loop(self) -> None:
+        """把「最新一次」滑块设置应用到手机；拖动产生的中间值直接跳过。"""
+        while True:
+            with self._display_lock:
+                job, self._display_want = self._display_want, None
+            if job is None:
+                return
+            config, seq, preview = job
+            try:
+                self._apply_display_once(config, seq, preview)
+            except Exception as exc:
+                detail = describe_exception(exc)
+                self._log(f"应用显示设置失败：{detail}", "err")
+                self._toast(f"应用显示设置失败：{describe_exception(exc, 80)}", "err")
+                self._set_display("显示：应用失败", "danger", detail=detail)
+
+    def _apply_display_once(self, config: AppConfig, seq: int, preview: bool) -> None:
+        with self._display_lock:
+            if seq != self._display_seq:
+                return    # 已经有更新的滑动，这一轮不用做了
+            if self._display_closing:
+                return    # 窗口正在关，别再动手机了
+        adb = self._open_adb(config.device_address or "", timeout=30.0)
+        controller = DisplayController(adb, log=self._log)
+
+        if not config.uses_display_override:
+            self._release_display_holder(reason="已复位手机的显示设置")
+            state = controller.reset_all()
+            with self._lock:
+                self._tuner_request = {}
+            self._set_display(
+                f"显示：未加长（{state.describe()}）", "success", detail=state.describe(),
+                has_override=state.has_override, state=state.as_dict(),
+            )
+            return
+
+        result = controller.apply(
+            scale=config.display_scale,
+            width_scale=config.display_width_scale,
+            density=config.display_density,
+            scaling=config.display_scaling,
+            screenshot=getattr(adb, "screenshot", None),
+        )
+        self._log(result.describe())
+        with self._lock:
+            # 记下「请求 vs 实际」：屏幕调节窗口据此提醒「手机没接受这组参数」
+            self._tuner_request = {
+                "requested": list(result.requested or ()),
+                "actual": list(result.actual or ()),
+                "density": int(result.density or 0),
+                "verified": bool(result.verified),
+                "note": str(result.note or ""),
+            }
+        state = controller.read_state()
+        if not result.verified:
+            self._release_display_holder()
+            self._set_display(
+                f"显示：{'密度' if result.density_only else '加长'}未生效"
+                f"（{result.note or '设备拒绝了该设置'}）",
+                "warning", detail=result.note, has_override=state.has_override,
+                state=state.as_dict(),
+            )
+            return
+
+        with self._display_lock:
+            hold = not self._display_closing
+            if hold:
+                self._display_holder = controller
+        if not hold:
+            # 窗口正在关：这次加长没人负责还原了，立刻自己复位
+            controller.restore()
+            return
+        if result.density_only:
+            text = f"显示：密度已改为 {result.density}（字变小、一屏装更多）"
+        else:
+            actual = result.actual or result.requested or (0, 0)
+            text = f"显示：已加长 {actual[0]}x{actual[1]}"
+            text += f"（{config.display_scale} 倍）" if not result.note else f"（{result.note}）"
+            if result.density:
+                text += f"，密度 {result.density}"
+        detail = f"{state.describe()}；点「复位显示」或退出程序都会还原"
+        self._set_display(
+            text, "success", detail=detail, has_override=state.has_override, state=state.as_dict()
+        )
+        if preview:
+            self._update_display_thumb(adb, result)
+
+    def _update_display_thumb(
+        self, adb: Any, result: ApplyResult | None = None, *, open_it: bool = False
+    ) -> None:
+        """抓一张小图给界面看效果。
+
+        图不进 150ms 的状态轮询（太大）：只把 thumb_seq 加一，前端发现变了就
+        pop_display_thumb() 取一次。全尺寸 PNG 存到临时目录：open_it=True 时顺手打开
+        （「抓全尺寸截图」按钮），平时只留个路径给缩略图点开用。
+        """
+        try:
+            data = adb.screenshot()
+        except Exception as exc:
+            self._log(f"实时预览截图失败：{describe_exception(exc)}", "err")
+            return
+        # 解不出尺寸就用这次应用报告的尺寸兜底（真机上两者一致）
+        fallback = (result.actual or result.requested) if result is not None else None
+        saved = self._save_shot(data, fallback=fallback)
+        path, size, thumb = saved["image"], saved["size"], saved["thumb"]
+        capture = {
+            "image": path,
+            "size": size,
+            "display": result.as_dict() if result is not None else {},
+        }
+        opened = False
+        if open_it and path:
+            capture["opened"] = self._open_path(path)
+            opened = bool(capture["opened"])
+        with self._lock:
+            self._display_thumb = thumb
+            display = self._state["display"]
+            display["thumb_seq"] = int(display.get("thumb_seq") or 0) + 1
+            display["capture"] = capture
+        if opened:
+            self._log(f"全尺寸截图已保存并打开：{path}（{size or '尺寸未知'}）")
+            self._toast(f"全尺寸截图：{size or '已生成'}", "ok")
+        elif size:
+            self._log(f"界面预览已更新：{size}")
+
+    def _save_shot(
+        self, data: bytes, *, prefix: str = "display_live", fallback: Any = None
+    ) -> dict[str, str]:
+        """截图 -> {image: 全尺寸 PNG 路径, size, thumb: 缩略图 data URL}。"""
+        size = ""
+        try:
+            width, height = image_size(data)
+            size = f"{width}x{height}"
+        except Exception:
+            if fallback:
+                size = f"{fallback[0]}x{fallback[1]}"
+        path = ""
+        try:
+            directory = tempfile.mkdtemp(prefix="drpilot-display-")
+            path = os.path.join(directory, f"{prefix}.png")
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except Exception as exc:
+            self._log(f"保存全尺寸截图失败：{describe_exception(exc)}", "warn")
+        thumb = ""
+        try:
+            thumb = to_thumb_data_url(data)
+        except Exception as exc:
+            self._log(f"生成缩略图失败：{describe_exception(exc)}", "warn")
+        return {"image": path, "size": size, "thumb": thumb}
+
+    def pop_display_thumb(self) -> dict[str, Any]:
+        """取走最近一张缩略图（取一次就清空，避免轮询反复搬大图）。"""
+        with self._lock:
+            thumb, self._display_thumb = self._display_thumb, ""
+        return {"ok": True, "thumb": thumb}
+
+    def open_display_capture(self) -> dict[str, Any]:
+        """用系统看图程序打开最近一次全尺寸截图。"""
+        with self._lock:
+            capture = dict((self._state.get("display") or {}).get("capture") or {})
+        path = str(capture.get("image") or "")
+        if not path or not os.path.isfile(path):
+            self._toast("还没有截图：先拖一下倍数，或点「抓全尺寸截图」", "err")
+            return {"ok": False}
+        return {"ok": self._open_path(path)}
+
+    # ---------------- 入口窗口（翻页动作 / 提取模块 / 模型服务 / 屏幕调节） ----------------
+    def open_panel(self, name: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """打开一个入口窗口；已经开着就把它拉到前面。
+
+        主界面只留入口卡片，真正的设置在各自的窗口里做；每个窗口只拿到自己
+        那几个桥方法（ActionPanelApi / ModulePanelApi / ModelPanelApi / DisplayTunerApi），
+        避免窗口之间互相误触。
+        """
+        key = str(name or "").strip().lower()
+        spec = PANEL_PAGES.get(key)
+        if spec is None:
+            return {"ok": False, "error": f"未知窗口：{name}"}
+        if self._window_factory is None:
+            self._toast("这个启动方式打不开独立窗口（用 drpilot --gui 启动才有）", "err")
+            return {"ok": False, "error": "no window factory"}
+        self._remember_form(payload)
+        with self._lock:
+            existing = self._windows.get(key)
+        if existing is not None:
+            for method in ("restore", "show"):
+                try:
+                    getattr(existing, method)()
+                except Exception:
+                    pass
+            return {"ok": True, "existing": True}
+
+        data = self.panel_payload(payload)
+        if key == "tuner":
+            # 屏幕调节窗口沿用原来那张「主界面表单」快照
+            self._tuner_payload_data = data
+            try:
+                self._tuner_config = config_from_payload(data, require_output=False)
+            except ConfigError:
+                self._tuner_config = self._config
+        label = PANEL_LABELS.get(key, key)
+        try:
+            window = self._window_factory(
+                spec["title"], spec["page"], self._panel_api(key), spec["width"], spec["height"]
+            )
+        except Exception as exc:
+            detail = describe_exception(exc)
+            self._log(f"打开「{label}」窗口失败：{detail}", "err")
+            self._toast(f"打开「{label}」窗口失败：{describe_exception(exc, 80)}", "err")
+            return {"ok": False, "error": detail}
+        with self._lock:
+            self._windows[key] = window
+        try:
+            window.events.closed += (lambda: self._on_panel_closed(key))
+        except Exception:
+            pass
+        self._log(f"已打开「{label}」窗口")
+        if key == "tuner":
+            self.tuner_ready()
+        return {"ok": True}
+
+    def _panel_api(self, name: str) -> Any:
+        if name == "tuner":
+            return DisplayTunerApi(self)
+        if name == "action":
+            return ActionPanelApi(self)
+        if name == "modules":
+            return ModulePanelApi(self)
+        if name == "model":
+            return ModelPanelApi(self)
+        raise ConfigError(f"未知窗口：{name}")
+
+    def _on_panel_closed(self, name: str) -> None:
+        with self._lock:
+            self._windows.pop(name, None)
+        if name == "tuner":
+            self._log("屏幕调节窗口已关闭（手机显示设置仍保持，可点「一键复位显示」还原）")
+        else:
+            self._log(f"「{PANEL_LABELS.get(name, name)}」窗口已关闭")
+
+    def open_display_tuner(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """打开独立的屏幕调节窗口（旧接口名，内部走 open_panel）。"""
+        return self.open_panel("tuner", payload)
+
+    def _on_tuner_closed(self) -> None:
+        """兼容旧调用：窗口关闭时清掉引用。"""
+        self._on_panel_closed("tuner")
+
+    # ---------------- 翻页动作窗口 ----------------
+    def _reference_text(self) -> str:
+        config = self._config
+        if config.swipe_reference_width and config.swipe_reference_height:
+            return f"{config.swipe_reference_width}x{config.swipe_reference_height}"
+        return ""
+
+    def _action_values(self) -> dict[str, Any]:
+        """翻页动作的当前值：窗口改过的 > 配置里的。"""
+        config = self._config
+        panel = self._panel_state.get("action") or {}
+        tap = dict(panel.get("tap") or {})
+        swipe = dict(panel.get("swipe") or {})
+        with self._lock:
+            action = copy.deepcopy(self._state.get("action") or {})
+        reference = str(panel.get("reference") or self._reference_text())
+        return {
+            "kind": str(panel.get("kind") or config.page_action or "auto").strip().lower(),
+            "tap": {
+                "x": int(tap.get("x", config.tap_x) or 0),
+                "y": int(tap.get("y", config.tap_y) or 0),
+                "ms": int(tap.get("ms", config.tap_ms) or 0),
+            },
+            "swipe": {
+                "x1": int(swipe.get("x1", config.swipe_start_x) or 0),
+                "y1": int(swipe.get("y1", config.swipe_start_y) or 0),
+                "x2": int(swipe.get("x2", config.swipe_end_x) or 0),
+                "y2": int(swipe.get("y2", config.swipe_end_y) or 0),
+                "duration": int(swipe.get("duration", config.swipe_duration_ms) or 0),
+                "retries": int(swipe.get("retries", config.max_swipe_retries) or 0),
+                "retry_wait": float(swipe.get("retry_wait", config.retry_wait) or 0),
+            },
+            "reference": reference,
+            "steps": action.get("steps") or steps_to_payload(normalize_steps(config.next_action)),
+            "summary": str(action.get("summary") or ""),
+            "note": str(action.get("note") or NOT_SET_ACTION_NOTE),
+        }
+
+    def _action_kind(self, values: Mapping[str, Any]) -> str:
+        """窗口里真正生效的那一种：auto 时按优先级推断成具体的一种。"""
+        kind = str(values.get("kind") or "auto").strip().lower()
+        if kind in ("tap", "swipe", "record"):
+            return kind
+        if values.get("steps"):
+            return "record"
+        tap = values.get("tap") or {}
+        if int(tap.get("x") or 0) > 0 and int(tap.get("y") or 0) > 0:
+            return "tap"
+        return "swipe"
+
+    def _action_form_patch(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        """窗口里的值 -> 主界面表单字段（_patch_form 用）。"""
+        tap = values.get("tap") or {}
+        swipe = values.get("swipe") or {}
+        return {
+            "page_action": self._action_kind(values),
+            "action_tap_x": int(tap.get("x") or 0),
+            "action_tap_y": int(tap.get("y") or 0),
+            "action_tap_ms": int(tap.get("ms") or 0),
+            "swipe_x1": int(swipe.get("x1") or 0),
+            "swipe_y1": int(swipe.get("y1") or 0),
+            "swipe_x2": int(swipe.get("x2") or 0),
+            "swipe_y2": int(swipe.get("y2") or 0),
+            "swipe_duration": int(swipe.get("duration") or 0),
+            "swipe_retries": int(swipe.get("retries") or 0),
+            "swipe_retry_wait": float(swipe.get("retry_wait") or 0),
+            "swipe_reference": str(values.get("reference") or ""),
+        }
+
+    def action_summary(self) -> str:
+        """主界面入口卡片上那行摘要。"""
+        values = self._action_values()
+        kind = self._action_kind(values)
+        tap = values["tap"]
+        swipe = values["swipe"]
+        if kind == "tap":
+            return f"点按 ({tap['x']}, {tap['y']})" if tap["x"] and tap["y"] else "点按（还没填坐标）"
+        if kind == "record":
+            steps = values.get("steps") or []
+            return f"录制动作 · {len(steps)} 步" if steps else "录制动作（还没录）"
+        return f"滑动 ({swipe['x1']},{swipe['y1']}) → ({swipe['x2']},{swipe['y2']})"
+
+    def action_state(self) -> dict[str, Any]:
+        """「翻页动作」窗口的完整状态（窗口 200ms 轮询一次）。"""
+        values = self._action_values()
+        with self._lock:
+            running = bool(self._state.get("running"))
+            recording = bool(self._state.get("recording"))
+        kind = self._action_kind(values)
+        return {
+            "ok": True,
+            "kind": kind,
+            "summary": self.action_summary(),
+            "tap": values["tap"],
+            "swipe": values["swipe"],
+            "record": {
+                "steps": values.get("steps") or [],
+                "summary": values.get("summary") or "",
+                "note": values.get("note") or "",
+            },
+            "reference": values.get("reference") or "",
+            "recording": recording,
+            "running": running,
+            "notice": self._panel_notice("action"),
+        }
+
+    def save_action_settings(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """保存「用哪一种 + 它的参数」，并回填主界面（开始提取时按同一套值跑）。"""
+        data: Mapping[str, Any] = values or {}
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind not in ("tap", "swipe", "record"):
+            return {"ok": False, "error": "请选择一种翻页动作：点按 / 滑动 / 录制动作"}
+        current = self._action_values()
+        merged = {
+            "kind": kind,
+            "tap": {**current["tap"], **dict(data.get("tap") or {})},
+            "swipe": {**current["swipe"], **dict(data.get("swipe") or {})},
+            "reference": data.get("reference", current.get("reference") or ""),
+        }
+        if kind == "tap":
+            tap = merged["tap"]
+            if int(tap.get("x") or 0) <= 0 or int(tap.get("y") or 0) <= 0:
+                return {"ok": False, "error": "点按需要填 X / Y（屏幕像素坐标）"}
+        self._panel_state["action"] = merged
+        patch = self._action_form_patch(merged)
+        payload = self.panel_payload(patch)
+        try:
+            config_from_payload(payload, require_output=False)
+        except ConfigError as exc:
+            return {"ok": False, "error": str(exc)}
+        self._patch_form(**patch)
+        self._log(f"翻页动作已设为：{self.action_summary()}")
+        return {"ok": True, "state": self.action_state()}
+
+    def test_panel_action(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """按窗口里当前的选择试一次翻页（没保存也能试）。"""
+        data: Mapping[str, Any] = values or {}
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind in ("tap", "swipe", "record"):
+            saved = self.save_action_settings(data)
+            if saved.get("ok") is False:
+                return saved
+        patch = self._action_form_patch(self._panel_state.get("action") or self._action_values())
+        return self.test_action(self.panel_payload(patch))
+
+    def clear_recorded(self) -> dict[str, Any]:
+        """清除录制的动作（点按 / 滑动参数保持不变）。"""
+        panel = dict(self._panel_state.get("action") or {})
+        panel["steps"] = []
+        self._panel_state["action"] = panel
+        self._patch_form(next_action="")
+        self._update("action", steps=[], summary="", note="已清除录制的动作")
+        self._log("已清除录制的翻页动作")
+        return {"ok": True, "state": self.action_state()}
+
+    # ---------------- 提取模块窗口 ----------------
+    def _unified_fields(self) -> list[dict[str, Any]]:
+        """本体字段（题号/题目/答案）+ 自定义模块，一份统一清单。"""
+        fields = {item["key"]: item for item in normalize_output_fields(self._config.output_fields)}
+        items: list[dict[str, Any]] = []
+        for base in BASE_FIELDS:
+            item = fields.get(base.key, {"in_json": True, "in_markdown": True})
+            items.append({
+                "kind": "base",
+                "key": base.key,
+                "name": base.name,
+                "note": base.note,
+                "json_keys": list(base.json_keys),
+                "in_json": bool(item.get("in_json")),
+                "in_markdown": bool(item.get("in_markdown")),
+            })
+        for spec in self._config.modules_specs:
+            data = spec.to_dict()
+            data["kind"] = "module"
+            items.append(data)
+        return items
+
+    def module_settings(self) -> dict[str, Any]:
+        """「提取模块」窗口的状态：清单 + 常用模块 + 手机显示（要不要加长屏）。"""
+        panel = self._panel_state.get("modules") or {}
+        items = panel.get("fields")
+        if items is None:
+            items = self._unified_fields()
+        with self._lock:
+            display = copy.deepcopy(self._state.get("display") or {})
+        return {
+            "ok": True,
+            "fields": items,
+            "presets": [spec.to_dict() for spec in PRESETS],
+            "max_modules": MAX_MODULES,
+            "summary": self.modules_summary_text(items),
+            "display": {
+                "text": str(display.get("text") or ""),
+                "tone": str(display.get("tone") or ""),
+                "detail": str(display.get("detail") or ""),
+            },
+        }
+
+    @staticmethod
+    def modules_summary_text(items: Any) -> str:
+        """主界面入口卡片上那行摘要。"""
+        names: list[str] = []
+        for item in items or []:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            names.append(name + ("*" if item.get("kind") == "base" else ""))
+        if not names:
+            return "没有字段"
+        return f"{len(names)} 项：" + "、".join(names[:4]) + ("…" if len(names) > 4 else "")
+
+    def save_module_settings(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """保存整份清单（本体字段 + 自定义模块），并回填主界面隐藏字段。"""
+        raw = list((values or {}).get("fields") or [])
+        base_items: list[dict[str, Any]] = []
+        module_items: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            data = dict(item)
+            kind = str(data.get("kind") or "").strip().lower()
+            if not kind:
+                kind = "base" if data.get("key") in {f.key for f in BASE_FIELDS} else "module"
+            (base_items if kind == "base" else module_items).append(data)
+        output_fields = normalize_output_fields(base_items)
+        try:
+            modules = normalize_modules(module_items, strict=True)
+        except ConfigError as exc:
+            return {"ok": False, "error": str(exc)}
+        if len(modules) > MAX_MODULES:
+            return {"ok": False, "error": f"自定义模块最多 {MAX_MODULES} 个"}
+        unified: list[dict[str, Any]] = []
+        base_map = {item["key"]: item for item in output_fields}
+        for base in BASE_FIELDS:
+            item = base_map.get(base.key)
+            if item is None:
+                continue
+            unified.append({
+                "kind": "base",
+                "key": base.key,
+                "name": base.name,
+                "note": base.note,
+                "json_keys": list(base.json_keys),
+                "in_json": bool(item.get("in_json")),
+                "in_markdown": bool(item.get("in_markdown")),
+            })
+        for spec in modules:
+            data = spec.to_dict()
+            data["kind"] = "module"
+            unified.append(data)
+        self._panel_state["modules"] = {"fields": unified}
+        self._patch_form(
+            output_fields=json.dumps(output_fields, ensure_ascii=False),
+            extract_modules=(
+                json.dumps(modules_to_payload(modules), ensure_ascii=False) if modules else ""
+            ),
+        )
+        self._log(
+            f"提取模块已更新：{output_fields_summary(output_fields)}；"
+            f"{len(modules)} 个自定义模块"
+        )
+        return {"ok": True, "state": self.module_settings()}
+
+    # ---------------- 模型服务窗口 ----------------
+    def model_settings(self) -> dict[str, Any]:
+        """「模型服务」窗口的状态：模型 / 地址 / Key / 连通性。"""
+        panel = self._panel_state.get("model") or {}
+        with self._lock:
+            model = copy.deepcopy(self._state.get("model") or {})
+            checking = bool(self._state.get("model_checking"))
+            keys = str(self._state.get("keys") or "")
+            key_items = copy.deepcopy(self._state.get("key_items") or [])
+            key_count = int(self._state.get("key_count") or 0)
+        return {
+            "ok": True,
+            "model": str(panel.get("model") or self._config.model or DEFAULT_MODEL),
+            "base_url": str(panel.get("base_url") or self._config.base_url or DEFAULT_BASE_URL),
+            "default_model": DEFAULT_MODEL,
+            "default_base_url": DEFAULT_BASE_URL,
+            "keys": keys,
+            "key_count": key_count,
+            "key_items": key_items,
+            "status": {
+                "text": str(model.get("text") or "模型：未测试"),
+                "tone": str(model.get("tone") or "muted"),
+                "note": str(model.get("note") or ""),
+            },
+            "checking": checking,
+            "running": bool(self._state.get("running")),
+            "notice": self._panel_notice("model"),
+        }
+
+    def save_model_settings(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """保存模型 ID 与 API 地址，并回填主界面隐藏字段。"""
+        data: Mapping[str, Any] = values or {}
+        model = _text(data, "model")
+        base_url = _text(data, "base_url")
+        if not model:
+            return {"ok": False, "error": "模型 ID 不能为空"}
+        if not base_url:
+            return {"ok": False, "error": "API 地址不能为空"}
+        if not base_url.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": "API 地址要以 http:// 或 https:// 开头"}
+        panel = dict(self._panel_state.get("model") or {})
+        panel.update({"model": model, "base_url": base_url.rstrip("/")})
+        self._panel_state["model"] = panel
+        self._patch_form(model=panel["model"], base_url=panel["base_url"])
+        self._log(f"模型服务已更新：{panel['model']} @ {panel['base_url']}")
+        return {"ok": True, "state": self.model_settings()}
+
+    def model_summary(self) -> str:
+        """主界面入口卡片上那行摘要。"""
+        panel = self._panel_state.get("model") or {}
+        model = str(panel.get("model") or self._config.model or DEFAULT_MODEL)
+        with self._lock:
+            count = int(self._state.get("key_count") or 0)
+        return f"{model} · {count} 个 Key" if count else f"{model} · 未配置 Key"
+
+    def tuner_payload(self) -> dict[str, Any]:
+        """调节窗口用的 payload（设备地址等来自主界面当前表单）。"""
+        return dict(self._tuner_payload_data or self._config_dict())
+
+    def tuner_ready(self) -> dict[str, Any]:
+        """窗口打开时调一次：读真机状态 + 抓一张「原本」的截图，然后返回状态。"""
+        payload = self.tuner_payload()
+        self.display_status(payload)
+        threading.Thread(
+            target=self._do_tuner_original, args=(payload,), name="drpilot-tuner-original", daemon=True
+        ).start()
+        return self.tuner_state()
+
+    def tuner_state(self) -> dict[str, Any]:
+        """调节窗口轮询的状态：物理尺寸、真机覆盖、三个设置值、状态文案、缩略图版本。"""
+        with self._lock:
+            display = copy.deepcopy(self._state.get("display") or {})
+            device = copy.deepcopy(self._state.get("device") or {})
+            original_seq = int(self._state.get("display", {}).get("original_seq") or 0)
+        with self._lock:
+            request = copy.deepcopy(self._tuner_request or {})
+        config = self._tuner_config or self._config
+        state = display.get("state") or {}
+        physical = parse_size(str(state.get("physical") or "")) or (0, 0)
+        override = parse_size(str(state.get("override") or ""))
+        width, height = physical
+        return {
+            "ok": True,
+            "device": str(device.get("text") or ""),
+            "text": str(display.get("text") or ""),
+            "tone": str(display.get("tone") or ""),
+            "detail": str(display.get("detail") or ""),
+            "physical": {"width": width, "height": height,
+                         "text": f"{width}x{height}" if width else ""},
+            "override": {
+                "width": override[0] if override else 0,
+                "height": override[1] if override else 0,
+                "density": int(state.get("density_override") or 0),
+                "has_override": bool(state.get("has_override")),
+            },
+            "settings": {
+                "scale": float(config.display_scale),
+                "width_scale": float(config.display_width_scale),
+                "density": int(config.display_density),
+            },
+            "limits": {
+                "max_scale": 3.0,
+                "max_width_scale": 2.5,
+                "max_density": 640,
+            },
+            # 最近一次「请求的尺寸 vs 手机实际接受的尺寸」：
+            # 两者不一致 = 设备静默忽略了过大的参数，界面要提醒用户
+            "requested": {
+                "has": bool(request),
+                "width": int((request.get("requested") or [0, 0])[0] or 0),
+                "height": int((request.get("requested") or [0, 0])[1] or 0),
+                "actual_width": int((request.get("actual") or [0, 0])[0] or 0),
+                "actual_height": int((request.get("actual") or [0, 0])[1] or 0),
+                "density": int(request.get("density") or 0),
+                "verified": bool(request.get("verified")),
+                "note": str(request.get("note") or ""),
+            },
+            "thumb_seq": int(display.get("thumb_seq") or 0),
+            "original_seq": original_seq,
+            "capture": display.get("capture") or {},
+            "running": bool(self._state.get("running")),
+        }
+
+    def tuner_apply(self, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """按调节窗口的三个数（宽 / 长 / 密度）改手机显示，并回填主界面的隐藏字段。"""
+        data = values or {}
+        current = self.tuner_payload()
+        try:
+            scale = float(data.get("scale", current.get("display_scale") or 1.0) or 1.0)
+            width_scale = float(data.get("width_scale", current.get("display_width_scale") or 1.0) or 1.0)
+            density = int(float(data.get("density", current.get("display_density") or 0) or 0))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "宽 / 长 / 密度必须是数字"}
+        wide = scale > 1.0 or width_scale > 1.0 or density > 0
+        payload = dict(current)
+        payload.update(
+            display_mode=wide,
+            display_scale=scale,
+            display_width_scale=width_scale,
+            display_density=density,
+        )
+        self._tuner_payload_data = payload
+        try:
+            self._tuner_config = config_from_payload(payload, require_output=False)
+        except ConfigError as exc:
+            self._toast(str(exc), "err")
+            return {"ok": False, "error": str(exc)}
+        # 主界面那三个隐藏字段跟着变：这样「开始提取」用的是同一套设置
+        self._patch_form(
+            display_scale=scale, display_width_scale=width_scale, display_density=density
+        )
+        return self.apply_display(payload)
+
+    def tuner_original(self) -> dict[str, Any]:
+        """重新抓一张「原本」的截图（秒回，真正的图随后 pop_original 取）。"""
+        threading.Thread(
+            target=self._do_tuner_original,
+            args=(self.tuner_payload(),),
+            name="drpilot-tuner-original",
+            daemon=True,
+        ).start()
+        return {"ok": True}
+
+    def pop_original(self) -> dict[str, Any]:
+        """取走「原本」的截图（取一次就清空）。"""
+        with self._lock:
+            payload, self._tuner_original = self._tuner_original, None
+        if payload is None:
+            return {"ok": True, "image": "", "size": "", "thumb": ""}
+        return {"ok": True, **payload}
+
+    def _do_tuner_original(self, payload: Mapping[str, Any]) -> None:
+        """抓一张当前手机画面当「原本」（不改任何显示设置）。"""
+        try:
+            address = address_from_payload(payload)
+            adb = self._open_adb(address, timeout=30.0)
+            data = adb.screenshot()
+        except Exception as exc:
+            self._log(f"抓「原本」截图失败：{describe_exception(exc)}", "err")
+            return
+        saved = self._save_shot(data, prefix="display_original")
+        with self._lock:
+            self._tuner_original = saved
+            display = self._state["display"]
+            display["original_seq"] = int(display.get("original_seq") or 0) + 1
+        self._log(f"「原本」截图已更新：{saved.get('size') or '尺寸未知'}")
+
+    def _release_display_holder(self, reason: str = "") -> bool:
+        """复位「界面上实时加长」留下的显示覆盖（如果有）。"""
+        with self._display_lock:
+            controller, self._display_holder = self._display_holder, None
+        if controller is None:
+            return True
+        try:
+            ok = controller.restore()
+            state = controller.read_state()
+        except Exception as exc:
+            self._log(f"复位显示设置失败：{describe_exception(exc)}", "err")
+            return False
+        self._update("display", state=state.as_dict(), has_override=state.has_override)
+        if reason:
+            self._log(f"{reason}：{'已还原' if ok else '可能没还原干净，可点「复位显示」'}")
+        return ok
 
     def pick_output_dir(self, initial: str = "") -> str:
         try:
@@ -1116,11 +2323,8 @@ class UiBridge:
             return ""
         return chosen or ""
 
-    def open_output_dir(self, directory: str = "") -> dict[str, Any]:
-        target = str(directory or self._config.output_dir or "").strip()
-        if not target or not os.path.isdir(target):
-            self._toast("输出文件夹还不存在，先选择或创建它", "err")
-            return {"ok": False}
+    def _open_path(self, target: str) -> bool:
+        """用系统默认程序打开文件 / 文件夹（Windows 用 startfile，其它平台 xdg-open）。"""
         try:
             if os.name == "nt":
                 os.startfile(target)  # type: ignore[attr-defined]
@@ -1128,14 +2332,33 @@ class UiBridge:
                 subprocess.Popen(["xdg-open", target])
         except Exception as exc:
             self._toast(f"打不开：{describe_exception(exc, 80)}", "err")
+            return False
+        return True
+
+    def open_output_dir(self, directory: str = "") -> dict[str, Any]:
+        target = str(directory or self._config.output_dir or "").strip()
+        if not target or not os.path.isdir(target):
+            self._toast("输出文件夹还不存在，先选择或创建它", "err")
             return {"ok": False}
-        return {"ok": True}
+        return {"ok": self._open_path(target)}
 
     def shutdown(self) -> None:
         """窗口关闭时调用：停掉正在跑的任务与录制（不销毁窗口）。"""
         self._record_stop.set()
         if self._session is not None:
             self._session.stop()
+        # 退出前必须把手机还原：实时滑块可能正留着加长状态
+        self._display_closing = True
+        with self._display_lock:
+            self._display_want = None
+        self._release_display_holder(reason="退出前把手机显示设置复位")
+        with self._lock:
+            windows, self._windows = list(self._windows.values()), {}
+        for window in windows:
+            try:
+                window.destroy()
+            except Exception:
+                pass
 
     def exit(self) -> dict[str, Any]:
         self.shutdown()

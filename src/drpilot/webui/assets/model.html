@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrPilot · 模型服务</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="panel-body">
+  <header class="panel-top">
+    <div>
+      <h1>模型服务</h1>
+      <p>默认 deepseek-flash · https://api.deepseek.com；换平台就改这两项，Key 存在项目根目录的 .env 里</p>
+    </div>
+    <div class="panel-top-actions">
+      <span class="pill" id="pill-model"><i class="dot"></i><span id="pill-model-text">模型：未测试</span></span>
+      <button class="btn small" id="btn-test">测试连通性</button>
+      <button class="btn primary small" id="btn-save">保存并应用</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <section class="card">
+      <div class="card-head">
+        <h2>模型</h2><span class="hint">识别题目用的视觉模型</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" id="btn-defaults">恢复默认（DeepSeek）</button>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <label class="field grow"><span>模型 ID</span><input id="model" placeholder="deepseek-flash"></label>
+          <label class="field grow"><span>API 地址</span><input id="base_url" placeholder="https://api.deepseek.com"></label>
+        </div>
+        <p class="note" id="model-note">开始提取前会自动测试模型连通性，模型下架时会立刻停下。</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>API Key</h2><span class="hint">多填几个可以并发提速（数量 ≤ 并发数）</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost hidden" id="btn-clear-keys">全部删除</button>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <label class="field grow"><span>新增</span>
+            <span class="secret">
+              <input id="api_key_input" type="password" autocomplete="new-password"
+                autocapitalize="off" autocorrect="off" spellcheck="false"
+                placeholder="粘贴新 Key（可多行 / 逗号分隔），回车即新增">
+              <button class="btn icon" id="btn-toggle-key" type="button"
+                title="隐私输入模式：点眼睛临时显示/隐藏你输入的内容"
+                aria-label="显示或隐藏输入的 API Key"><span id="key-eye">👁</span></button>
+            </span>
+          </label>
+          <button class="btn small primary" id="btn-add-key">＋ 新增 API Key</button>
+        </div>
+        <div class="row keys-line">
+          <span class="hint" id="key-info">正在读取 API Key…</span>
+          <span class="spacer"></span>
+          <button class="btn small ghost hidden" id="btn-reveal">显示已保存</button>
+        </div>
+        <div class="key-chips" id="key-chips"></div>
+        <pre class="note hidden" id="key-plain"></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer class="panel-foot">
+    <span class="panel-hint" id="notice">Key 明文只写进 .env；日志、配置、界面列表一律脱敏。</span>
+    <span class="spacer"></span>
+    <span class="panel-hint" id="batch-hint"></span>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="panel.js"></script>
+  <script src="model.js"></script>
+</body>
+</html>

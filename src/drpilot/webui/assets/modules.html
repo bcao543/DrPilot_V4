@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrPilot · 提取模块</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="panel-body">
+  <header class="panel-top">
+    <div>
+      <h1>提取模块</h1>
+      <p>题号 / 题目 / 答案 是默认三项（可删），下面还能加任意自定义模块；每项都能单独决定写不写进 JSONL 与 Markdown</p>
+    </div>
+    <div class="panel-top-actions">
+      <span class="pill" id="pill-summary"><i class="dot"></i><span id="pill-summary-text">读取中…</span></span>
+      <button class="btn primary small" id="btn-save">保存并应用</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <section class="card">
+      <div class="card-head">
+        <h2>模块设置</h2><span class="hint">参数都可自定义，勾选即生效</span>
+        <span class="spacer"></span>
+        <span class="hint" id="count-hint"></span>
+      </div>
+      <div class="rows">
+        <div class="module-list" id="module-list"></div>
+        <div class="row">
+          <button class="btn small" id="btn-add-module">＋ 添加模块</button>
+          <span class="hint" id="module-status">只填模块名就行，别名 / 位置 / 输出都可以后面再调</span>
+        </div>
+        <div class="row" id="module-presets">
+          <span class="group-label">常用模块</span>
+          <span class="hint">点一下加一行（模块名会成为 JSONL 的键与 Markdown 的小标题）</span>
+        </div>
+        <p class="note">
+          JSONL 用的是固定键（题号 id、题目 stem/options、答案 answer，自定义模块收在 modules 里），
+          Markdown 用中文小标题排版；两边的开关互不影响 —— 比如「答案」只写 Markdown、不进 JSONL 也行。
+        </p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>首屏之外的模块</h2><span class="hint">加长主屏才能一屏截全</span>
+        <span class="spacer"></span>
+        <button class="btn small" id="btn-open-display">打开屏幕调节…</button>
+      </div>
+      <div class="rows">
+        <span class="hint" id="display-status">显示：未读取</span>
+        <p class="note">「考点还原 / 标准解析」这类内容通常在首屏下面：先把手机显示临时加长，再开始提取才能一次截全；
+          程序在结束与异常时都会自动复位。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="panel-foot">
+    <span class="panel-hint" id="notice">改完点右上角「保存并应用」；主界面「开始提取」会照这套清单跑。</span>
+    <span class="spacer"></span>
+    <span class="panel-hint" id="max-hint"></span>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="panel.js"></script>
+  <script src="modules.js"></script>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrPilot · 屏幕调节</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="tuner.css">
+</head>
+<body class="panel-body">
+  <header class="panel-top">
+    <div>
+      <h1>屏幕调节</h1>
+      <p>宽 / 长 / 密度：拖滑块或直接输入，停手 0.4 秒自动应用到手机；退出程序会自动复位</p>
+    </div>
+    <div class="panel-top-actions">
+      <span class="pill" id="pill-device"><i class="dot"></i><span id="pill-device-text">设备：读取中…</span></span>
+      <button class="btn small" id="btn-capture">抓全尺寸截图</button>
+      <button class="btn small danger" id="btn-reset">一键复位显示</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <div class="tuner-grid">
+      <section class="card">
+        <div class="card-head">
+          <h2>原本</h2>
+          <span class="hint" id="original-note">—</span>
+          <span class="spacer"></span>
+          <button class="btn small ghost" id="btn-reload-original">重新取图</button>
+        </div>
+        <div class="stage" id="stage-a">
+          <div class="phone" id="phone-a"><img id="img-original" alt=""></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>调节后</h2>
+          <span class="hint" id="target-note">—</span>
+          <span class="spacer"></span>
+          <span class="hint" id="accepted-note"></span>
+        </div>
+        <div class="stage" id="stage-b">
+          <div class="phone" id="phone-b"><img id="img-live" alt=""></div>
+        </div>
+      </section>
+
+      <section class="card span-2">
+        <div class="card-head">
+          <h2>参数</h2><span class="hint">物理尺寸是下限；上限由程序按经验给出，设备不一定全接受</span>
+          <span class="spacer"></span>
+          <button class="btn small" id="btn-native">回到物理尺寸</button>
+          <button class="btn primary small" id="btn-apply">立即应用</button>
+        </div>
+        <div class="rows node-box">
+          <div class="row slider-row">
+            <span class="slider-name">宽</span>
+            <input type="range" id="rng-width" aria-label="宽">
+            <input id="in-width" class="w-md num" inputmode="numeric"><em>px</em>
+          </div>
+          <div class="row slider-row">
+            <span class="slider-name">长</span>
+            <input type="range" id="rng-height" aria-label="长">
+            <input id="in-height" class="w-md num" inputmode="numeric"><em>px</em>
+          </div>
+          <div class="row slider-row">
+            <span class="slider-name">密度</span>
+            <input type="range" id="rng-density" aria-label="密度">
+            <input id="in-density" class="w-xs num" inputmode="numeric"><em>0 = 跟随系统</em>
+          </div>
+          <p class="note warn" id="warn-note">
+            提醒：手机有可能不接受某些参数（超过上限的尺寸会被系统静默忽略，只接受一部分）。
+            每次应用后请看下面的「手机实际」：和「请求」不一致就说明设备没接受，把数值调小再试。
+          </p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="panel-foot">
+    <span class="panel-hint" id="status">显示：未读取</span>
+    <span class="spacer"></span>
+    <span class="panel-hint" id="request-note"></span>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="panel.js"></script>
+  <script src="tuner.js"></script>
+</body>
+</html>

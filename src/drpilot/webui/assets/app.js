@@ -1,23 +1,44 @@
-/* DrPilot v4 前端逻辑：只跟 Python 桥（window.pywebview.api）打交道，
+/* DrPilot v4 主页面逻辑：只跟 Python 桥（window.pywebview.api）打交道，
    轮询拿日志/进度，所有耗时操作都在 Python 侧后台线程里跑。
+
+   主页面只保留「每次都要改」的三块（任务范围 / 手机连接 / 识别与输出）：
+   翻页动作、提取模块、模型服务、屏幕调节都在入口卡片打开的独立窗口里配，
+   改完由桥回填到下面的 hidden 载体（见 index.html 末尾），
+   所以 payload() 依旧是一份完整表单。
+
    直接用浏览器打开时自动进入「界面预览」模式，方便调版面。 */
 (function () {
   "use strict";
 
+  // 主页面上的输入（含隐藏载体）：payload() 会把它们原样交给后端
   const TEXT_FIELDS = [
     "page_from", "page_to", "textbook", "chapter", "chapter_no", "chapter_total",
-    "output_dir", "model", "base_url", "batch_size", "workers", "wait_ms",
+    "output_dir", "batch_size", "workers", "wait_ms", "max_tokens",
     "device_ip", "device_port",
+    // 下面这些由四个设置窗口回填（hidden input）
+    "model", "base_url", "page_action", "next_action",
+    "action_tap_x", "action_tap_y", "action_tap_ms",
     "swipe_x1", "swipe_y1", "swipe_x2", "swipe_y2",
     "swipe_duration", "swipe_retries", "swipe_retry_wait", "swipe_reference",
-    "next_action", "action_tap_x", "action_tap_y", "action_tap_ms",
+    "extract_modules", "output_fields",
+    "display_scale", "display_width_scale", "display_density",
   ];
   const FLAGS = {
     "opt-md": "generate_markdown",
     "opt-index": "generate_index",
     "opt-preflight": "preflight",
     "opt-check-model": "check_model",
+    // 界面上不暴露的隐藏开关：只用来原样带回命令行设过的 display_scaling
+    "opt-display-scaling": "display_scaling",
   };
+  // 入口卡片 -> 状态摘要字段（tuner 的摘要来自 display 状态）
+  const ENTRIES = [
+    ["action", "entry-action", "note-action"],
+    ["modules", "entry-modules", "note-modules"],
+    ["model", "entry-model", "note-model"],
+    ["tuner", "entry-tuner", "note-tuner", "display"],
+  ];
+
   const $ = (id) => document.getElementById(id);
   const backend = () => (window.pywebview && window.pywebview.api) || null;
 
@@ -27,9 +48,9 @@
   let previewTimer = null;
   let previewSeq = 0;        // 「将输出」请求序号，防止旧结果覆盖新结果
   let lastState = null;      // 最近一次后端状态，供「并发」提示等即时重算
+  let wasRunning = false;    // 上一帧是否在跑（用来在跑完时刷新手机显示状态）
   let horse = null;          // 右下角的点阵马（背景动效）
   let horseRunning = null;
-  // API Key 的隐私输入状态只存在 DOM 里（type=password），后端只回脱敏列表
 
   /* ---------------- 表单 ---------------- */
   const missingReported = new Set();
@@ -53,6 +74,9 @@
       const el = control(id);
       data[key] = el ? !!el.checked : true;
     }
+    // 加长主屏：三个隐藏字段里只要有一个不是默认值，就算要动手机显示设置
+    // （长/宽/密度都能单独用；屏幕调节窗口会把这里的值回填好）
+    data.display_mode = displayWanted(displayValues());
     return data;
   }
 
@@ -65,6 +89,11 @@
     for (const [id, key] of Object.entries(FLAGS)) {
       const el = control(id);
       if (el && data[key] !== undefined) el.checked = !!data[key];
+    }
+    // 配置里 display_mode 是关的（或没配过），就把三个字段归零：
+    // 否则配置里那个默认的 2.0 倍会在「开始提取」时被当成用户要加长
+    if (!data.display_mode) {
+      syncDisplayFields({ scale: 1, widthScale: 1, density: 0 });
     }
   }
 
@@ -131,15 +160,20 @@
     }
   }
 
+  /* 入口卡片上的一行摘要（来自后端 state.panels） */
+  function renderEntries(panels) {
+    if (!panels) return;
+    for (const item of ENTRIES) {
+      const note = $(item[2]);
+      if (note) note.textContent = panels[item[3] || item[0]] || "";
+    }
+  }
+
   function render(s) {
     if (!s) return;
     lastState = s;
     setPill($("pill-device"), s.device.text, s.device.tone);
     setPill($("pill-model"), s.model.text, s.model.tone);
-    $("model-note").textContent = s.model.note || "";
-    $("model-note").style.color = s.model.tone === "danger" ? "var(--red)" : "var(--muted)";
-    $("key-info").textContent = s.keys || "";
-    renderKeys(s);
     $("device-detail").textContent = s.device.detail || "";
     $("device-detail").style.color = s.device.tone === "danger" ? "var(--red)" : "var(--muted)";
 
@@ -152,13 +186,6 @@
     $("btn-stop").disabled = !s.running || !!s.stopping;   // 停止中就别再点了
     if (s.total_hint) $("total-hint").textContent = s.total_hint;
     if (s.output_preview) $("output-preview").textContent = s.output_preview;
-    if (s.model_checking) {
-      $("btn-test-model").disabled = true;
-      $("btn-test-model").textContent = "测试中…";
-    } else {
-      $("btn-test-model").disabled = false;
-      $("btn-test-model").textContent = "测试连通性";
-    }
     $("btn-connect").disabled = !!s.device.busy;
     $("btn-connect").innerHTML = s.device.busy ? "<b>⇄</b> 连接中…" : "<b>⇄</b> 连接";
 
@@ -173,8 +200,11 @@
     }
 
     renderWorkers(s.workers);
-    renderAction(s.action);
+    renderEntries(s.panels);
     updateWorkersHint();
+    // 提取运行中不让开「屏幕调节」：改显示设置会把正在跑的提取搞乱
+    const tunerEntry = $("entry-tuner");
+    if (tunerEntry) tunerEntry.disabled = !!s.running;
     // 开始提取 → 粒子变蓝、马儿奔跑；点停止（stopping）或跑完 → 立刻灰色静止
     const active = !!s.running && !s.stopping;
     if (horse && active !== horseRunning) {
@@ -184,9 +214,15 @@
     if (s.form_patch) {
       for (const [key, value] of Object.entries(s.form_patch)) {
         const el = $(key);
-        if (el) el.value = value;
+        if (!el) continue;
+        // 勾选框写 .checked（display_scaling 回填的就是布尔），其余写 .value
+        if (el.type === "checkbox") el.checked = !!value;
+        else el.value = value;
       }
     }
+    // 运行结束：管线跑完会自己复位手机，状态栏要跟着回到真机读数
+    if (wasRunning && !s.running) call("display_status", payload());
+    wasRunning = !!s.running;
     (s.toasts || []).forEach((t) => toast(t.text, t.tone));
 
     if (s.question) {
@@ -280,6 +316,7 @@
         demoPreview();
         return;
       }
+      // preview() 顺手把这份表单记在后端：入口窗口打开时用它当基准
       const res = await call("preview", payload());
       if (!res || seq !== previewSeq) return;   // 有更新的请求了，丢掉这份旧结果
       // 出错时后端会返回空 total_hint + 错误文案，这里必须照写，避免留下过期的旧预览
@@ -288,123 +325,30 @@
     }, 180);
   }
 
-  /* ---------------- API Key（模型服务卡片内：隐私输入 + 新增 / 删除） ---------------- */
-  function keyInputText() {
-    const el = $("api_key_input");
-    if (!el) return "";
-    let text = el.value.trim();
-    if (!text) return "";
-    // 单行输入框粘贴多行时换行会被浏览器压掉；没有 "=" 时统一按空白切成多个 Key
-    if (text.indexOf("=") < 0) text = text.replace(/\s+/g, ",");
-    return text;
+  /* ---------------- 手机显示（屏幕调节窗口回填的三个隐藏字段） ---------------- */
+  function displayValues() {
+    const read = function (id, fallback) {
+      const el = $(id);
+      const num = Number(el ? el.value : fallback);
+      return isFinite(num) ? num : fallback;
+    };
+    return {
+      scale: Math.max(1, read("display_scale", 1)),
+      widthScale: Math.max(1, read("display_width_scale", 1)),
+      density: Math.max(0, Math.round(read("display_density", 0))),
+    };
   }
 
-  function setKeyVisible(on) {
-    const el = $("api_key_input");
-    const btn = $("btn-toggle-key");
-    const eye = $("key-eye");
-    if (el) el.type = on ? "text" : "password";
-    if (btn) {
-      btn.classList.toggle("active", !!on);
-      btn.title = on ? "当前是明文：点一下回到隐私输入模式（圆点）" : "隐私输入模式：点一下临时显示输入内容";
-      btn.setAttribute("aria-label", btn.title);
-    }
-    if (eye) eye.textContent = on ? "🙈" : "👁";
+  /* 需不需要动手机显示设置：加长 / 加宽 / 只把密度调小，都算 */
+  function displayWanted(v) {
+    return v.scale > 1 || v.widthScale > 1 || v.density > 0;
   }
 
-  function clearKeyInput() {
-    const el = $("api_key_input");
-    if (el) el.value = "";
-    setKeyVisible(false);              // 新增完立刻回到密文，明文不在 DOM 里多待
-  }
-
-  let keysSignature = "";    // 已保存列表的内容指纹：没变就不重建 DOM
-
-  function renderKeys(s) {
-    const box = $("key-chips");
-    if (!box) return;
-    const items = (s && s.key_items) || [];
-    const clearBtn = $("btn-clear-keys");
-    if (clearBtn) clearBtn.classList.toggle("hidden", !items.length);
-    const signature = JSON.stringify(items);
-    // 每 150ms 轮询一次；无脑重建会把「鼠标正按着的按钮」换掉，点击就丢了
-    if (signature === keysSignature) return;
-    keysSignature = signature;
-    box.innerHTML = "";
-    items.forEach((item) => {
-      const chip = document.createElement("span");
-      chip.className = "key-chip";
-      const label = document.createElement("span");
-      label.textContent = item.masked || ("#" + item.index);
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "chip-del";
-      del.title = "删除这个 API Key";
-      del.setAttribute("aria-label", "删除 " + label.textContent);
-      del.textContent = "✕";
-      del.onclick = () => deleteKey(item.index);
-      chip.appendChild(label);
-      chip.appendChild(del);
-      box.appendChild(chip);
-    });
-  }
-
-  function applyKeyResult(res) {
-    if (!lastState) lastState = {};
-    if (typeof res.count === "number") lastState.key_count = res.count;
-    if (res.items) lastState.key_items = res.items;
-    renderKeys(lastState);
-    updateWorkersHint();               // 「并发」旁边的提示马上跟着变
-  }
-
-  async function addKey() {
-    const text = keyInputText();
-    if (!text) {
-      toast("请先填写要新增的 API Key", "err");
-      const el = $("api_key_input");
-      if (el) el.focus();
-      return;
-    }
-    const res = await call("add_keys", { text: text });
-    if (!res || res.ok === false) {
-      if (res) toast(res.error || "新增失败", "err");
-      return;
-    }
-    clearKeyInput();
-    applyKeyResult(res);
-    toast(res.added
-      ? "已新增 " + res.added + " 个 API Key（共 " + res.count + " 个）"
-      : "这些 Key 已经保存过了，没有重复写入", "ok");
-  }
-
-  async function deleteKey(index) {
-    const items = (lastState && lastState.key_items) || [];
-    const target = items.filter((it) => it.index === index)[0];
-    const label = (target && target.masked) || ("#" + index);
-    if (!window.confirm("确定删除 API Key " + label + " 吗？\n删除后运行将不再使用这个 Key。")) return;
-    const res = await call("delete_key", { index: index });
-    if (!res) return;
-    if (res.ok === false) {
-      toast(res.error || "删除失败", "err");
-      return;
-    }
-    applyKeyResult(res);
-    toast("已删除 " + label, "ok");
-  }
-
-  async function clearKeys() {
-    const items = (lastState && lastState.key_items) || [];
-    if (!items.length) return;
-    if (!window.confirm("确定删除全部 " + items.length + " 个 API Key 吗？\n删除后需要重新新增才能开始提取。")) return;
-    const res = await call("clear_keys");
-    if (!res) return;
-    if (res.ok === false) {
-      toast(res.error || "删除失败", "err");
-      return;
-    }
-    clearKeyInput();
-    applyKeyResult(res);
-    toast("已删除全部 API Key", "ok");
+  /* 直接写这三个隐藏字段（配置回填 / 复位用） */
+  function syncDisplayFields(values) {
+    if (values.scale !== undefined && $("display_scale")) $("display_scale").value = String(values.scale);
+    if (values.widthScale !== undefined && $("display_width_scale")) $("display_width_scale").value = String(values.widthScale);
+    if (values.density !== undefined && $("display_density")) $("display_density").value = String(values.density);
   }
 
   /* ---------------- 事件绑定 ---------------- */
@@ -414,13 +358,6 @@
       if (res && res.ok === false) toast(res.error || "无法开始", "err");
     };
     $("btn-stop").onclick = () => call("stop");
-    $("btn-test-model").onclick = () => call("test_model", payload());
-    $("btn-add-key").onclick = addKey;
-    $("btn-toggle-key").onclick = () => setKeyVisible($("api_key_input").type === "password");
-    $("btn-clear-keys").onclick = clearKeys;
-    $("api_key_input").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); addKey(); }   // 粘贴后回车即新增
-    });
     $("btn-connect").onclick = () => call("connect_device", payload());
     $("btn-disconnect").onclick = () => call("disconnect_device", payload());
     $("btn-refresh-devices").onclick = () => call("refresh_devices");
@@ -433,22 +370,21 @@
     };
     $("btn-open-dir").onclick = () => call("open_output_dir", $("output_dir").value.trim());
     $("btn-clear-log").onclick = () => { $("log").innerHTML = ""; };
-    $("btn-set-reference").onclick = () => call("set_reference", payload());
-    $("btn-test-swipe").onclick = () => call("test_swipe", payload());
-    $("btn-record-start").onclick = () => call("start_record", payload());
-    $("btn-record-stop").onclick = () => call("stop_record");
-    $("btn-test-action").onclick = () => call("test_action", payload());
-    $("btn-action-clear").onclick = () => call("clear_action");
-    $("btn-use-tap").onclick = () => call("use_tap", payload());
-    $("btn-swipe-toggle").onclick = (e) => { e.stopPropagation(); toggleSwipe(); };
-    $("swipe-head").onclick = toggleSwipe;
     $("btn-exit").onclick = () => { const api = backend(); if (api) api.exit(); else toast("预览模式无法退出", "err"); };
     $("modal-yes").onclick = () => answer(true);
     $("modal-no").onclick = () => answer(false);
-    $("modal-title").onclick = null;
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && modalOpen) answer(false); });
 
-    for (const id of ["page_from", "page_to", "textbook", "chapter", "chapter_no", "chapter_total", "output_dir"]) {
+    // 入口卡片：打开对应的独立设置窗口（窗口里的改动会回填到隐藏载体）
+    for (const el of document.querySelectorAll(".entry")) {
+      el.onclick = async () => {
+        const res = await call("open_panel", el.dataset.panel, payload());
+        if (res && res.ok === false) toast(res.error || "打不开设置窗口", "err");
+      };
+    }
+
+    for (const id of ["page_from", "page_to", "textbook", "chapter", "chapter_no", "chapter_total",
+                      "output_dir", "device_ip", "device_port"]) {
       $(id).addEventListener("input", schedulePreview);
     }
     // 开关也会影响「将输出」（生成 Markdown / index.json），必须一起刷新
@@ -459,65 +395,6 @@
     for (const id of ["device_ip", "device_port"]) {
       $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") call("connect_device", payload()); });
     }
-  }
-
-  /* ---------------- 翻页动作（录制 / 步骤列表） ---------------- */
-  function stepText(s) {
-    if (!s) return "";
-    if (s.kind === "tap") {
-      return "点击 (" + s.x + "," + s.y + ")" + (s.duration_ms >= 80 ? "，按住 " + s.duration_ms + "ms" : "");
-    }
-    if (s.kind === "swipe") {
-      return "滑动 (" + s.x + "," + s.y + ") → (" + s.x2 + "," + s.y2 + ")，" + s.duration_ms + "ms";
-    }
-    if (s.kind === "path") {
-      return "精确滑动 " + ((s.points || []).length) + " 个点，" + (s.duration_ms || 0) + "ms";
-    }
-    if (s.kind === "key") return "按键 " + s.keycode;
-    if (s.kind === "wait") return "等待 " + s.wait_ms + "ms";
-    return String(s.kind || "");
-  }
-
-  function renderAction(a) {
-    const status = $("action-status");
-    const list = $("action-steps");
-    if (!status || !list) return;
-    const data = a || {};
-    const steps = data.steps || [];
-    const recording = !!data.recording;
-    const running = !!(lastState && lastState.running);
-
-    if (recording) {
-      status.textContent = data.note || "录制中…请在手机上完成一次「下一题」动作";
-      status.style.color = "var(--blue, #2f6fed)";
-    } else if (steps.length) {
-      const note = data.note || ("已录制 " + steps.length + " 步");
-      status.textContent = note + (data.reference ? "　基准 " + data.reference : "");
-      status.style.color = "var(--muted)";
-    } else {
-      status.textContent = data.note || "未设置：将使用下方手动滑动坐标";
-      status.style.color = "var(--muted)";
-    }
-
-    list.innerHTML = "";
-    steps.forEach((s) => {
-      const li = document.createElement("li");
-      li.textContent = stepText(s);
-      list.appendChild(li);
-    });
-
-    const start = $("btn-record-start");
-    const stop = $("btn-record-stop");
-    const test = $("btn-test-action");
-    if (start) start.disabled = recording || running;
-    if (stop) stop.disabled = !recording;
-    if (test) test.disabled = recording || running || !steps.length;
-  }
-
-  function toggleSwipe() {
-    const body = $("swipe-body");
-    const open = body.classList.toggle("hidden");
-    $("btn-swipe-toggle").textContent = open ? "展开 ▾" : "收起 ▴";
   }
 
   /* ---------------- 预览模式（浏览器直开时） ----------------
@@ -532,40 +409,24 @@
     $("pill-model").after(tag);
     setPill($("pill-device"), "设备：1 台在线", "success");
     setPill($("pill-model"), "模型：可用", "success");
-    $("model-note").textContent = "✓ 示例：模型可调用 · 812 ms";
-    $("model-note").style.color = "#1f7a4a";
     $("device-detail").textContent = "示例：已连接手机 · 1080x2340";
     $("device-detail").style.color = "#1f7a4a";
-    $("key-info").textContent = "示例：已加载 3 个 API Key（.env 3 个）";
-    lastState = {
-      key_count: 3,
-      key_masked: "sk-********ab12 / sk-********cd34 / sk-********ef56",
-      key_items: [
-        { index: 1, masked: "sk-********ab12" },
-        { index: 2, masked: "sk-********cd34" },
-        { index: 3, masked: "sk-********ef56" },
-      ],
-    };
-    renderKeys(lastState);
+    lastState = { key_count: 3 };
     updateWorkersHint();
-    renderAction({
-      recording: false,
-      steps: [
-        { kind: "tap", x: 540, y: 2280, duration_ms: 80 },
-        { kind: "wait", wait_ms: 300 },
-        { kind: "swipe", x: 960, y: 1200, x2: 240, y2: 1200, duration_ms: 260 },
-      ],
-      summary: "示例步骤",
-      reference: "示例 1080x2340",
-      note: "示例：已加载 3 步",
+    renderEntries({
+      action: "录制动作 · 3 步",
+      modules: "5 项：题号*、题目*、答案*、考点还原、标准解析",
+      model: "deepseek-flash · 3 个 Key",
+      display: "显示：示例（物理 1260x2720，未加长）",
     });
+    syncDisplayFields({ scale: 1, widthScale: 1, density: 0 });
+    $("max_tokens").value = "4096";
     $("bar").style.width = "35%";
     $("cur").textContent = "第 7 题（7/20）";
     const st = $("status");
     st.textContent = "运行中";
     st.className = "status";
     renderWorkers([{ id: 1, status: "处理批次 2", done: 2 }, { id: 2, status: "空闲", done: 1 }]);
-    if (location.hash === "#expand") toggleSwipe();
     appendLogs([
       { text: "（以下为界面预览示例日志，不是真实运行结果）", tone: "warn" },
       { text: "示例：正在 adb connect 手机 …" },
@@ -573,6 +434,7 @@
       { text: "示例：模型连通性正常 · 812 ms", tone: "ok" },
       { text: "示例：设备分辨率 1080x2340" },
       { text: "示例：翻页动作 点击 → 等待 → 滑动" },
+      { text: "示例：输出字段：题号→JSONL/Markdown、题目→JSONL/Markdown、答案→JSONL/Markdown" },
       { text: "示例：计划 Q1~Q20，共 20 张截图；批大小 3，并发 2" },
       { text: "示例：预检当前屏幕显示第 1 题" },
       { text: "示例：截图（7/20），预期第 7 题" },
@@ -626,6 +488,8 @@
       if (init.state) render(init.state);
       appendLogs(init.logs);
     }
+    schedulePreview();                   // 顺便把表单记到后端（入口窗口的基准）
+    call("display_status", payload());   // 顺便读一次手机显示设置
     poll();
   }
 

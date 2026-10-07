@@ -35,12 +35,18 @@ from .config import (
     save_config_file,
 )
 from .errors import AdbError, AiError, ConfigError, OutputError
+from .modules import (
+    modules_summary,
+    modules_to_payload,
+    normalize_modules,
+    parse_modules_text,
+)
 from .nlparse import describe_params, parse_request
 from .runlog import RunLogger, mask_secrets
 
-SUBCOMMANDS = ("devices", "doctor", "check-model", "schema", "ask")
+SUBCOMMANDS = ("devices", "doctor", "check-model", "schema", "ask", "modules", "display", "capture")
 # 允许把后续参数原样透传给主 parser 的子命令（ask 需要完整的运行参数）
-PASSTHROUGH_SUBCOMMANDS = ("ask",)
+PASSTHROUGH_SUBCOMMANDS = ("ask", "capture")
 
 
 def _configure_console() -> None:
@@ -222,6 +228,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         help="滑动坐标的基准分辨率，如 1080x2340；不填或 auto 表示首次运行自动记录",
     )
     parser.add_argument(
+        "--page-action",
+        choices=("auto", "tap", "swipe", "record"),
+        help="翻页方式：auto（录制动作>手动点按>滑动）/ tap / swipe / record",
+    )
+    parser.add_argument(
         "--next-action-file",
         metavar="PATH",
         help='翻页动作 JSON（GUI 录制导出：{"reference":"WxH","steps":[...]} 或裸步骤数组）',
@@ -231,6 +242,80 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         action="append",
         metavar="X,Y",
         help="把点按坐标加入翻页动作（可重复），例如 --tap 630,2380",
+    )
+
+    parser.add_argument(
+        "--modules",
+        dest="modules_text",
+        metavar="LIST",
+        help="额外要提取的模块，逗号分隔（如 考点还原,标准解析）；会替换配置文件里的清单",
+    )
+    parser.add_argument(
+        "--module-file",
+        metavar="PATH",
+        help='模块清单 JSON 文件：{"modules":[…] } 或 ["考点还原","标准解析"]',
+    )
+    parser.add_argument(
+        "--display",
+        dest="display_mode",
+        choices=("off", "wide"),
+        help="加长主屏：wide = 运行期间临时放大逻辑屏高度，一屏装下考点还原/标准解析（结束或异常都会复位）",
+    )
+    parser.add_argument(
+        "--display-scale",
+        type=float,
+        help="加长倍数（默认 2.0；设备可能静默忽略过大值，程序会自动降级并回读校验）",
+    )
+    parser.add_argument(
+        "--display-width-scale",
+        type=float,
+        dest="display_width_scale",
+        help="逻辑屏加宽到物理宽的几倍（默认 1.0 不加宽；1.2~1.5 能让 App 按更宽的画布重排版）",
+    )
+    parser.add_argument(
+        "--display-density",
+        type=int,
+        help=(
+            "改逻辑密度（默认不改，保住字形大小；改小可再装更多但字会变小）。"
+            "倍数为 1 时可以单独用：--display wide --display-scale 1 --display-density 420"
+        ),
+    )
+    parser.add_argument(
+        "--display-scaling",
+        choices=("auto", "off"),
+        help="off = 物理屏按 1:1 裁剪显示（不变形）；不影响截图内容",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        dest="max_tokens",
+        help="单次 AI 回复的最大 token 数（模块多、正文长时调大，默认 4096）",
+    )
+    parser.add_argument(
+        "--list-modules",
+        action="store_true",
+        help="列出可用模块目录与当前配置（drpilot modules）",
+    )
+    parser.add_argument(
+        "--display-info",
+        action="store_true",
+        help="打印手机当前显示设置（drpilot display）",
+    )
+    parser.add_argument(
+        "--probe",
+        type=float,
+        metavar="SCALE",
+        help="配合 display：试一次加长（SCALE 倍）并立即复位，报告前后尺寸",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="配合 display：无条件复位手机的 wm size / density / scaling",
+    )
+    parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="只截当前题存成 PNG（按当前显示设置，不调用 AI、不需要 Key）",
     )
 
     parser.add_argument("--serial", help="ADB 设备 serial（多设备时指定）")
@@ -253,10 +338,16 @@ SUBCOMMAND_FLAGS = {
     "check-model": "--check-model",
     "schema": "--schema",
     "ask": "--ask",
+    "modules": "--list-modules",
+    "display": "--display-info",
+    "capture": "--capture",
 }
 # 子命令里允许透传给顶层 parser 的开关（带值的单独列出来）
 _SUBCOMMAND_GLOBAL_FLAGS = ("--json", "--full", "--debug", "--no-log-file", "--yes", "-y")
 _SUBCOMMAND_VALUE_FLAGS = ("--config", "--log-file")
+# 只有某些子命令才认的开关（避免 drpilot doctor --reset 这种写法被悄悄接受）
+_SUBCOMMAND_EXTRA_FLAGS = {"display": ("--reset",)}
+_SUBCOMMAND_EXTRA_VALUE_FLAGS = {"display": ("--probe", "--output-dir")}
 
 
 def _expand_subcommand(argv: Sequence[str]) -> list[str]:
@@ -278,18 +369,22 @@ def _expand_subcommand(argv: Sequence[str]) -> list[str]:
     forwarded = [SUBCOMMAND_FLAGS[command]]
     if command in PASSTHROUGH_SUBCOMMANDS:
         return forwarded + list(rest)
+    extra_flags = _SUBCOMMAND_EXTRA_FLAGS.get(command, ())
+    extra_value_flags = _SUBCOMMAND_EXTRA_VALUE_FLAGS.get(command, ())
     index = 0
     while index < len(rest):
         token = rest[index]
-        if token in _SUBCOMMAND_VALUE_FLAGS:         # 带值开关要先处理，否则会把值当未知参数
-            if index + 1 >= len(rest):
+        if token in _SUBCOMMAND_VALUE_FLAGS or token in extra_value_flags:
+            if index + 1 >= len(rest):               # 带值开关要先处理，否则会把值当未知参数
                 raise ConfigError(f"{token} 后面缺少值")
             forwarded.extend([token, rest[index + 1]])
             index += 1
-        elif token in _SUBCOMMAND_GLOBAL_FLAGS:
+        elif token in _SUBCOMMAND_GLOBAL_FLAGS or token in extra_flags:
             forwarded.append(token)
         else:
-            allowed = " / ".join(_SUBCOMMAND_GLOBAL_FLAGS + _SUBCOMMAND_VALUE_FLAGS)
+            allowed = " / ".join(
+                _SUBCOMMAND_GLOBAL_FLAGS + _SUBCOMMAND_VALUE_FLAGS + extra_flags + extra_value_flags
+            )
             raise ConfigError(f"{command} 不接受参数 {token!r}（只支持 {allowed}）")
         index += 1
     return forwarded
@@ -446,7 +541,7 @@ def _run_command_line(args: argparse.Namespace, *, template: bool = False) -> st
             return placeholder
         return current if current not in (None, "") else None
 
-    values = {
+    values: dict[str, Any] = {
         "--from": value("page_from", "<起始题号>"),
         "--to": value("page_to", "<结束题号>"),
         "--output-dir": value("output_dir", "<输出文件夹>"),
@@ -454,6 +549,28 @@ def _run_command_line(args: argparse.Namespace, *, template: bool = False) -> st
         "--chapter": value("chapter", "<章节>"),
         "--connect": value("device_address", "") if template else value("device_address", ""),
     }
+    # 提取模块与加长屏只在使用者显式提过时才带上（模板模式下也不加占位符：
+    # 它们是可选能力，不该出现在「最少要跑什么」的命令里）
+    for flag, dest, keep in (
+        ("--modules", "modules_text", True),
+        ("--display", "display_mode", True),
+        ("--display-scale", "display_scale", False),
+        ("--display-width-scale", "display_width_scale", False),
+        ("--display-density", "display_density", False),
+        ("--max-tokens", "max_tokens", False),
+    ):
+        current = getattr(args, dest, None)
+        if current in (None, "", 0, 1.0) and dest != "display_width_scale":
+            continue
+        if dest == "display_width_scale" and current in (None, "", 0):
+            continue
+        if keep and not template:
+            values[flag] = current
+        elif keep and template:
+            # 用户确实提了模块/加长屏：模板里保留真实值，别让 Agent 拼出的命令丢掉它
+            values[flag] = current
+        elif not keep and not template:
+            values[flag] = current
     return contract.format_command(values, extra=["--dry-run"] if template else [])
 
 
@@ -561,7 +678,7 @@ def _check_model_command(config: AppConfig, out: _Output) -> int:
             "missing_api_key",
             "未找到 API Key",
             phase="env",
-            suggestion="在 GUI 的「模型服务」卡片点「＋ 新增 API Key」，或把 Key 写进 .env",
+            suggestion="在 GUI 的「入口 → 模型服务」窗口点「＋ 新增 API Key」，或把 Key 写进 .env",
             extra={"model": config.model, "base_url": config.base_url},
         )
     out.info(f"正在测试模型：{config.model}")
@@ -665,7 +782,12 @@ def _ask_command(args: argparse.Namespace, out: _Output) -> int:
     if not (args.chapter or config_data.get("chapter")):
         notes.append("未提供章节名：缺少章节元数据，补录时容易和目标文件对不上。")
     if key_count == 0:
-        notes.append("当前没有可用的 API Key：先在 GUI「模型服务」里新增，或写进 .env。")
+        notes.append("当前没有可用的 API Key：先在 GUI「入口 → 模型服务」里新增，或写进 .env。")
+    if not (getattr(args, "modules_text", None) or config_data.get("modules")):
+        notes.append(
+            "如需「考点还原 / 标准解析」等首屏之外的内容：加 --modules 考点还原,标准解析 "
+            "与 --display wide（先跑 drpilot modules --json 看可用模块）。"
+        )
     payload: dict[str, Any] = {
         "mode": "ask",
         "ready": ready,
@@ -688,6 +810,242 @@ def _ask_command(args: argparse.Namespace, out: _Output) -> int:
         if ready and payload["command"]:
             out.info("可直接运行：" + str(payload["command"]))
     return out.emit(exitcodes.SUCCESS if ready else exitcodes.CONFIG_INVALID)
+
+
+# ---------------- 模块 / 显示 / 截图 子命令 ----------------
+def _modules_command(args: argparse.Namespace, out: _Output) -> int:
+    """列出可用模块目录与当前配置（只读，人和 Agent 都用）。"""
+    from .modules import PRESETS, module_names, modules_summary
+
+    used_path: str | None = None
+    specs = []
+    try:
+        config, used_path = load_config_with_fallback(args.config)
+        specs = config.modules_specs
+    except ConfigError as exc:
+        return out.fail(
+            exitcodes.CONFIG_INVALID,
+            "config_file_invalid",
+            f"配置错误：{exc}",
+            phase="config",
+            suggestion="检查配置文件里的 modules 字段；drpilot modules --json 给出可用模块目录",
+            exc=exc,
+        )
+
+    payload: dict[str, Any] = {
+        "mode": "modules",
+        "presets": [spec.to_dict() for spec in PRESETS],
+        "current": module_names(specs),
+        "current_detail": modules_to_payload(specs),
+        "summary": modules_summary(specs),
+        "config_path": used_path,
+        "usage": {
+            "flag": "--modules",
+            "example": (
+                contract.RUN_PREFIX
+                + " --from 1 --to 20 --output-dir D:\\题库 --textbook 药理学"
+                + ' --chapter "第二章 药物代谢动力学" --modules 标准解析,考点还原 --display wide'
+            ),
+            "note": "模块名同时是 JSONL 的键与 Markdown 的小标题；想用英文键就起英文名",
+        },
+        "notes": [
+            "below_fold=true 的模块通常要加长屏幕或下滑才截得到，配合 --display wide 使用；",
+            "截图里没有的模块会留空字符串，不会编造；",
+            "必读模块（required）缺失时，日志与 diagnostics.missing_modules 会点名题号，方便补录。",
+        ],
+    }
+    out.set_result(payload)
+    if not args.json_output:
+        out.info("可用模块（--modules 里直接写名字，命中预设会自动带出别名与定位说明）：")
+        for spec in PRESETS:
+            out.info(f"  · {spec.describe()}")
+        out.info("")
+        out.info(f"当前配置：{payload['summary']}")
+        out.info("用法：" + payload["usage"]["example"])
+    return out.emit(exitcodes.SUCCESS)
+
+
+def _display_command(args: argparse.Namespace, out: _Output) -> int:
+    """查看 / 复位 / 试跑「加长主屏」。"""
+    from pathlib import Path
+
+    from .adb import AdbClient
+    from .display import DisplayController
+
+    try:
+        client = AdbClient(adb_path=args.adb_path, serial=args.serial)
+        if args.device_address:
+            out.info(f"正在连接 {args.device_address} …")
+            out.info(client.connect(args.device_address))
+        device = client.ensure_device()
+    except AdbError as exc:
+        return out.fail(
+            exitcodes.ENV_UNAVAILABLE,
+            "adb_unavailable",
+            f"ADB 错误：{exc}",
+            phase="connect",
+            suggestion="确认手机已连接（drpilot devices --json）；无线调试用 --connect IP:5555",
+            exc=exc,
+        )
+
+    controller = DisplayController(client, log=out.info)
+    state = controller.read_state()
+    payload: dict[str, Any] = {
+        "mode": "display",
+        "device": device.describe(),
+        "state": state.as_dict(),
+        "state_text": state.describe(),
+    }
+    out.info(f"当前显示：{state.describe()}")
+
+    if args.reset:
+        after = controller.reset_all()
+        payload["reset"] = True
+        payload["state"] = after.as_dict()
+        payload["state_text"] = after.describe()
+        out.info(f"已复位：{after.describe()}")
+    elif args.probe is not None:
+        scale = float(args.probe)
+        result, before, after = controller.probe(
+            scale=scale,
+            width_scale=float(args.display_width_scale or 1.0),
+            density=int(args.display_density or 0),
+            scaling=str(args.display_scaling or "auto"),
+        )
+        payload["probe"] = result.as_dict()
+        saved: dict[str, str] = {}
+        if before or after:
+            directory = _probe_directory(args)
+            for name, data in (("before", before), ("after", after)):
+                if not data:
+                    continue
+                target = Path(directory) / f"display_probe_{name}.png"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                saved[name] = str(target)
+                out.info(f"截图：{target}")
+        payload["screenshots"] = saved
+        if result.verified:
+            out.info(
+                f"加长成功：{result.requested[0]}x{result.requested[1]}"
+                f"（{result.settled_ms} ms 稳定），已自动复位"
+            )
+        else:
+            out.warn(f"加长未生效：{result.note or '设备没有接受这个尺寸'}（已复位）")
+
+    # 收尾再确认一次没有残留覆盖
+    final = controller.read_state()
+    payload["final_state"] = final.as_dict()
+    if final.has_override:
+        out.warn(
+            f"[警告] 手机上仍有显示覆盖（{final.describe()}）："
+            "执行 drpilot display --reset 可恢复"
+        )
+    out.set_result(payload)
+    return out.emit(exitcodes.SUCCESS)
+
+
+def _probe_directory(args: argparse.Namespace) -> str:
+    """探测截图存哪：优先 --output-dir，否则用临时目录。"""
+    import tempfile
+
+    directory = getattr(args, "output_dir", "") or ""
+    if directory:
+        return directory
+    return tempfile.mkdtemp(prefix="drpilot-display-")
+
+
+def _capture_command(args: argparse.Namespace, parser: argparse.ArgumentParser, out: _Output) -> int:
+    """只截当前题存成 PNG：不调用 AI、不需要 API Key，用来肉眼验收「能截到多少内容」。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from .adb import AdbClient
+    from .display import DisplayController
+    from .images import image_size
+
+    try:
+        config, used_path = _build_config(args, parser)
+    except ConfigError as exc:
+        return out.fail(
+            exitcodes.CONFIG_INVALID,
+            "config_invalid",
+            f"配置错误：{exc}",
+            phase="config",
+            suggestion="检查参数；drpilot schema --json 有完整参数表",
+            exc=exc,
+        )
+    if used_path:
+        out.info(f"已加载配置：{used_path}")
+
+    directory = config.output_dir or tempfile.mkdtemp(prefix="drpilot-capture-")
+    target_dir = _Path(directory) / "capture"
+    adb = AdbClient(adb_path=config.adb_path, serial=config.serial, log=out.info)
+    controller = DisplayController(adb, log=out.info)
+    payload: dict[str, Any] = {"mode": "capture", "output_dir": str(directory)}
+    try:
+        if config.device_address:
+            try:
+                out.info(f"无线连接 {config.device_address}：{adb.connect(config.device_address)}")
+            except Exception as exc:
+                out.warn(f"无线连接失败（改用已连接的设备）：{exc}")
+        device = adb.ensure_device()
+        out.info(f"设备：{device.describe()}")
+        if config.uses_display_override:
+            result = controller.apply(
+                scale=config.display_scale,
+                width_scale=config.display_width_scale,
+                density=config.display_density,
+                scaling=config.display_scaling,
+                screenshot=getattr(adb, "screenshot", None),
+            )
+            payload["display"] = result.as_dict()
+            out.info(result.describe())
+        data = adb.screenshot()
+    except AdbError as exc:
+        return out.fail(
+            exitcodes.ENV_UNAVAILABLE,
+            "adb_error",
+            f"截图失败：{exc}",
+            phase="capture",
+            suggestion="确认手机解锁、App 停在题目页；drpilot devices --json 看连接",
+            exc=exc,
+        )
+    finally:
+        controller.restore()
+
+    try:
+        width, height = image_size(data)
+    except Exception as exc:
+        return out.fail(
+            exitcodes.RUN_FAILED,
+            "capture_failed",
+            f"截图格式异常：{exc}",
+            phase="capture",
+            suggestion="重试一次；仍失败就检查 adb screencap 是否正常",
+            exc=exc,
+        )
+    # 只在用户显式给了 --from 时才用题号命名，否则叫 current（截图是"当前屏幕"而不是某一题）
+    number = int(config.page_from or 0) if getattr(args, "page_from", None) else 0
+    label = f"Q{number:04d}" if number > 0 else "current"
+    path = target_dir / f"{label}_capture.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    payload.update(
+        {
+            "ok": True,
+            "image": str(path),
+            "size": f"{width}x{height}",
+            "bytes": len(data),
+            "from": number or None,
+            "modules": [spec.name for spec in config.modules_specs],
+        }
+    )
+    out.info(f"截图已保存：{path}（{width}x{height}，{len(data)} 字节）")
+    if not config.modules_specs:
+        out.info("[提示] 没有配置 --modules：只截了一张整屏图；配 --modules 考点还原,标准解析 再跑一次就能核对能不能截全")
+    out.set_result(payload)
+    return out.emit(exitcodes.SUCCESS)
 
 
 # ---------------- 参数装配 ----------------
@@ -736,6 +1094,9 @@ def _build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         action_steps = action_steps + _tap_steps(args.tap, parser)
     if action_steps:
         overrides["next_action"] = steps_to_payload(action_steps[:32])
+        if args.page_action is None:
+            # 命令行明确给了动作，就别让配置文件里存的 swipe/tap 选择把它顶掉
+            overrides["page_action"] = "auto"
     if action_reference:
         overrides["swipe_reference_width"], overrides["swipe_reference_height"] = action_reference
     # 只给了 --chapter 没给 --chapter-no 时，章号必须从新的章节名重新解析。
@@ -745,6 +1106,23 @@ def _build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         derived = parse_chapter_no(args.chapter)
         if derived > 0:
             overrides["chapter_no"] = derived
+    modules_value: Any = None
+    if args.module_file:
+        from .fileio import read_json_file
+
+        try:
+            data = read_json_file(args.module_file)
+        except Exception as exc:
+            parser.error(f"读取模块清单失败：{args.module_file}（{exc}）")
+            raise
+        modules_value = data.get("modules") if isinstance(data, dict) else data
+        if modules_value is None:
+            parser.error(f"模块清单文件里没有 modules 字段：{args.module_file}")
+    if args.modules_text is not None:
+        modules_value = parse_modules_text(args.modules_text)
+    if modules_value is not None:
+        # strict=True：模块名重复/与固定字段重名时直接报错，别悄悄丢掉
+        overrides["modules"] = modules_to_payload(normalize_modules(modules_value, strict=True))
     if args.wait_ms is not None:
         overrides["wait"] = float(args.wait_ms) / 1000.0
     if args.swipe_reference:
@@ -807,8 +1185,8 @@ def _apply_natural_language(args: argparse.Namespace, out: _Output) -> None:
 def _interactive_fill(args: argparse.Namespace, missing: Sequence[dict[str, Any]], out: _Output) -> bool:
     """缺参数时逐项问用户；返回是否补齐。"""
     dests = [item["dest"] for item in missing]
-    # 必填的问完再顺带问教材/章节，避免来回跑两趟
-    for dest in ("textbook", "chapter"):
+    # 必填的问完再顺带问教材/章节/模块，避免来回跑两趟
+    for dest in ("textbook", "chapter", "modules_text"):
         if dest not in dests:
             dests.append(dest)
     out.info("参数还不齐，下面几个问题填一下就能开始（Ctrl+C 取消）：")
@@ -894,7 +1272,7 @@ def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser, out:
         message = str(exc)
         code = "missing_api_key" if not config.api_keys else "config_invalid"
         suggestion = (
-            "在 GUI「模型服务」卡片点「＋ 新增 API Key」，或把 Key 写进 .env；再跑 drpilot doctor --json"
+            "在 GUI「入口 → 模型服务」窗口点「＋ 新增 API Key」，或把 Key 写进 .env；再跑 drpilot doctor --json"
             if code == "missing_api_key"
             else "按提示修正参数后重跑；先跑 drpilot doctor --json 看环境"
         )
@@ -922,6 +1300,23 @@ def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser, out:
         out.info("[dry-run] 配置校验通过，未连接手机、未调用 AI。")
         out.info(f"[dry-run] 输出目录：{paths.directory}")
         out.info(f"[dry-run] 将生成：{paths.jsonl}" + (f" / {paths.markdown}" if paths.markdown else ""))
+        modules = config.modules_specs
+        if modules:
+            out.info("[dry-run] 提取模块：" + modules_summary(modules))
+        if config.uses_display_override:
+            if config.display_scale > 1:
+                what = f"加长主屏：{config.display_scale} 倍"
+                if config.display_width_scale > 1.0:
+                    what += f"，加宽 {config.display_width_scale} 倍"
+                if config.display_density:
+                    what += f"，密度 {config.display_density}"
+            elif config.display_width_scale > 1.0:
+                what = f"只加宽：{config.display_width_scale} 倍（高不变）"
+                if config.display_density:
+                    what += f"，密度 {config.display_density}"
+            elif config.display_density:
+                what = f"只改显示密度：{config.display_density}（截图尺寸不变）"
+            out.info(f"[dry-run] {what}（运行时会临时设置，结束或异常都会自动复位）")
         out.set_result(
             {
                 "dry_run": True,
@@ -936,6 +1331,16 @@ def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser, out:
                 "index": paths.index,
                 "key_count": len(config.api_keys),
                 "questions": 0,
+                "modules": [spec.name for spec in modules],
+                "display": {
+                    "mode": config.display_mode,
+                    "scale": config.display_scale,
+                    "width_scale": config.display_width_scale,
+                    "density": config.display_density,
+                    "scaling": config.display_scaling,
+                },
+                "max_tokens": config.max_tokens,
+                "batch_size": config.batch_size,
             }
         )
         return out.emit(exitcodes.SUCCESS)
@@ -997,7 +1402,12 @@ def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser, out:
         "stopped": bool(session.stop_event.is_set()),
         "error": str(session.error) if session.error else None,
         "diagnostics": diagnostics,
+        # 模块与加长屏的结果：字段从 diagnostics 取，兼容只实现 diagnostics() 的假会话
+        "modules": diagnostics.get("modules") or [],
+        "display": diagnostics.get("display"),
     }
+    if diagnostics.get("missing_modules"):
+        payload["missing_modules"] = diagnostics["missing_modules"]
     if failed_numbers:
         payload["failed_question_numbers"] = failed_numbers
         payload["retry_command"] = _retry_command(config, failed_numbers)
@@ -1119,6 +1529,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.ask:
             return _ask_command(args, out)
 
+        if args.list_modules:
+            return _modules_command(args, out)
+
+        if args.display_info:
+            return _display_command(args, out)
+
+        if args.capture:
+            return _capture_command(args, parser, out)
+
         if args.doctor:
             return _doctor_command(args, out)
 
@@ -1153,7 +1572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 from .webui import run_web_ui
 
-                return run_web_ui(config_path=args.config)
+                return run_web_ui(config_path=args.config, logger=logger)
             except Exception as exc:  # 缺少 pywebview、WebView2 运行时缺失等
                 return out.fail(
                     exitcodes.ENV_UNAVAILABLE,

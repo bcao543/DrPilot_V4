@@ -16,6 +16,7 @@ from drpilot.config import (
     chapter_slug,
     load_api_keys,
     load_config_file,
+    load_config_with_fallback,
     parse_chapter_no,
     parse_size,
     resolve_output_paths,
@@ -24,6 +25,67 @@ from drpilot.config import (
     strip_chapter_prefix,
 )
 from drpilot.errors import ConfigError
+
+
+class PageActionTests(unittest.TestCase):
+    """翻页动作的三选一 + 手动点按坐标。"""
+
+    def test_defaults_are_backward_compatible(self):
+        cfg = AppConfig()
+        self.assertEqual(cfg.page_action, "auto")
+        self.assertEqual((cfg.tap_x, cfg.tap_y, cfg.tap_ms), (0, 0, 80))
+
+    def test_unknown_value_falls_back_to_auto(self):
+        self.assertEqual(AppConfig.from_dict({"page_action": "乱写"}).page_action, "auto")
+        self.assertEqual(AppConfig.from_dict({"page_action": " TAP "}).page_action, "tap")
+
+    def test_tap_coordinates_normalized(self):
+        cfg = AppConfig.from_dict({"tap_x": "-5", "tap_y": "12", "tap_ms": "-1"})
+        self.assertEqual((cfg.tap_x, cfg.tap_y, cfg.tap_ms), (0, 12, 0))
+
+
+class OutputFieldConfigTests(unittest.TestCase):
+    """配置文件里的本体字段开关。"""
+
+    def test_default_is_all_three(self):
+        self.assertEqual([item["key"] for item in AppConfig().output_fields], ["id", "stem", "answer"])
+        self.assertEqual(set(AppConfig().output_field_map), {"id", "stem", "answer"})
+
+    def test_empty_list_survives_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "drpilot_config.json")
+            save_config_file(path, AppConfig.from_dict({"output_fields": []}))
+            loaded = AppConfig.from_dict(load_config_file(path))
+            self.assertEqual(loaded.output_fields, [])
+
+    def test_missing_key_uses_default(self):
+        self.assertEqual(
+            [item["key"] for item in AppConfig.from_dict({}).output_fields],
+            ["id", "stem", "answer"],
+        )
+
+
+class DefaultModelMigrationTests(unittest.TestCase):
+    """老配置里从没改过的默认模型值，跟着新版默认走。"""
+
+    def test_legacy_defaults_are_migrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "drpilot_config.json")
+            save_config_file(path, AppConfig(model="Qwen/Qwen3.5-4B",
+                                             base_url="https://api.siliconflow.cn/v1"))
+            config, used = load_config_with_fallback(path)
+            self.assertEqual(used, path)
+            self.assertEqual(config.model, "deepseek-flash")
+            self.assertEqual(config.base_url, "https://api.deepseek.com")
+
+    def test_user_chosen_model_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "drpilot_config.json")
+            save_config_file(path, AppConfig(model="my-vision-model",
+                                             base_url="https://api.example.com/v1"))
+            config, _ = load_config_with_fallback(path)
+            self.assertEqual(config.model, "my-vision-model")
+            self.assertEqual(config.base_url, "https://api.example.com/v1")
 
 
 class ConfigTests(unittest.TestCase):
@@ -201,6 +263,54 @@ class ConfigTests(unittest.TestCase):
             loaded = AppConfig.from_dict(load_config_file(path))
             self.assertEqual(loaded.page_from, 10)
             self.assertEqual(loaded.textbook, "药理学")
+
+
+class DisplayConfigTests(unittest.TestCase):
+    """显示设置：加长 / 加宽 / 只改密度都算「要动手机显示」，三者互不依赖。"""
+
+    def test_uses_display_override_for_each_knob(self):
+        self.assertFalse(AppConfig().uses_display_override)                     # 默认 off
+        self.assertFalse(
+            AppConfig(display_mode="wide", display_scale=1.0).uses_display_override  # 什么都没改
+        )
+        self.assertTrue(
+            AppConfig(display_mode="wide", display_scale=2.0).uses_display_override
+        )
+        self.assertTrue(
+            AppConfig(display_mode="wide", display_scale=1.0, display_width_scale=1.3)
+            .uses_display_override
+        )
+        self.assertTrue(
+            AppConfig(display_mode="wide", display_scale=1.0, display_density=420)
+            .uses_display_override
+        )
+        # mode=off 时一律不动手机（安全开关优先）
+        self.assertFalse(
+            AppConfig(display_mode="off", display_scale=2.0, display_width_scale=1.5)
+            .uses_display_override
+        )
+
+    def test_width_scale_is_clamped(self):
+        self.assertEqual(AppConfig(display_width_scale=9.0).normalize().display_width_scale, 2.5)
+        self.assertEqual(AppConfig(display_width_scale=0.2).normalize().display_width_scale, 1.0)
+
+    def test_width_only_passes_validation(self):
+        config = AppConfig(
+            display_mode="wide", display_scale=1.0, display_width_scale=1.3,
+            page_from=1, page_to=2, output_dir="/tmp/x",
+        )
+        config.api_keys = ["sk-test"]
+        config.validate()      # 不该抛：只加宽也是有效的显示设置
+
+    def test_nothing_configured_is_rejected_for_wide(self):
+        config = AppConfig(
+            display_mode="wide", display_scale=1.0, display_width_scale=1.0,
+            display_density=0, page_from=1, page_to=2, output_dir="/tmp/x",
+        )
+        config.api_keys = ["sk-test"]
+        with self.assertRaises(ConfigError) as ctx:
+            config.validate()
+        self.assertIn("显示设置", str(ctx.exception))
 
 
 if __name__ == "__main__":

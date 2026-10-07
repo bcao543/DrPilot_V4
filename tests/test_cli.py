@@ -349,7 +349,7 @@ class AgentCliTests(KeyEnvMixin, unittest.TestCase):
         code, stdout, _ = self._capture(["schema", "--json"])
         self.assertEqual(code, exitcodes.SUCCESS)
         schema = json.loads(stdout)
-        self.assertEqual(schema["schema_version"], 4)
+        self.assertEqual(schema["schema_version"], 5)
         names = [spec["name"] for spec in schema["params"]]
         self.assertIn("--from", names)
         self.assertIn("--output-dir", names)
@@ -542,6 +542,138 @@ class RunFailureReportTests(KeyEnvMixin, unittest.TestCase):
         self.assertEqual(payload["error_code"], "precheck_failed")
         self.assertIn("--force-start", payload["suggestion"])
 
+
+
+
+class ModulesAndDisplayCliTests(KeyEnvMixin, unittest.TestCase):
+    """模块 / 加长主屏 / 截图 三条 CLI 路径。"""
+
+    def _capture(self, argv):
+        argv = list(argv) + ["--no-log-file"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_modules_command_lists_presets(self):
+        code, stdout, _ = self._capture(["modules", "--json"])
+        self.assertEqual(code, exitcodes.SUCCESS)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["mode"], "modules")
+        names = [item["name"] for item in payload["presets"]]
+        self.assertIn("考点还原", names)
+        self.assertIn("标准解析", names)
+        self.assertEqual(payload["current"], [])
+        self.assertIn("--modules", payload["usage"]["example"])
+
+    def test_modules_command_reads_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.json"
+            path.write_text(
+                json.dumps({
+                    "page_from": 1, "page_to": 2, "output_dir": tmp,
+                    "modules": [{"name": "考点还原", "below_fold": True}],
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            code, stdout, _ = self._capture(["modules", "--config", str(path), "--json"])
+            self.assertEqual(code, exitcodes.SUCCESS)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["current"], ["考点还原"])
+
+    def test_dry_run_reports_modules_and_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self._capture([
+                "--from", "1", "--to", "3", "--output-dir", tmp,
+                "--modules", "考点还原,标准解析", "--display", "wide",
+                "--dry-run", "--json",
+            ])
+            self.assertEqual(code, exitcodes.SUCCESS, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["modules"], ["考点还原", "标准解析"])
+            self.assertEqual(payload["display"]["mode"], "wide")
+            self.assertEqual(payload["display"]["scale"], 2.0)
+
+    def test_reserved_module_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout, stderr = self._capture([
+                "--from", "1", "--to", "3", "--output-dir", tmp,
+                "--modules", "answer", "--dry-run", "--json",
+            ])
+            self.assertEqual(code, exitcodes.CONFIG_INVALID)
+            payload = json.loads(stdout)
+            self.assertFalse(payload["ok"])
+            self.assertIn("重名", stderr + payload.get("error", ""))
+
+    def test_module_file_is_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "modules.json"
+            path.write_text(json.dumps({"modules": ["考点还原"]}, ensure_ascii=False), encoding="utf-8")
+            code, stdout, _ = self._capture([
+                "--from", "1", "--to", "3", "--output-dir", tmp,
+                "--module-file", str(path), "--dry-run", "--json",
+            ])
+            self.assertEqual(code, exitcodes.SUCCESS)
+            self.assertEqual(json.loads(stdout)["modules"], ["考点还原"])
+
+    def test_ask_mentions_modules_hint(self):
+        code, stdout, _ = self._capture(["ask", "--json"])
+        self.assertEqual(code, exitcodes.CONFIG_INVALID)
+        payload = json.loads(stdout)
+        self.assertTrue(any("--modules" in note for note in payload["notes"]))
+
+    def test_ask_command_keeps_modules_and_display(self):
+        """ask 给出的可复制命令不能把 --modules / --display 丢掉。"""
+        code, stdout, _ = self._capture([
+            "ask", "--from", "1", "--to", "5", "--output-dir", "/tmp/t",
+            "--modules", "考点还原", "--display", "wide", "--json",
+        ])
+        self.assertEqual(code, exitcodes.SUCCESS)
+        payload = json.loads(stdout)
+        self.assertTrue(payload["ready"])
+        self.assertIn("--modules", payload["command"])
+        self.assertIn("考点还原", payload["command"])
+        self.assertIn("--display wide", payload["command"])
+
+    def test_natural_language_fills_modules_and_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = f"第 1 到 3 题，存到 {tmp}，要考点还原和标准解析，加长屏幕一次截全"
+            code, stdout, _ = self._capture(["--text", text, "--dry-run", "--json"])
+            self.assertEqual(code, exitcodes.SUCCESS)
+            payload = json.loads(stdout)
+            self.assertEqual(sorted(payload["modules"]), ["标准解析", "考点还原"])
+            self.assertEqual(payload["display"]["mode"], "wide")
+
+
+class SubcommandRoutingTests(unittest.TestCase):
+    """子命令的参数白名单：只放行自己认识的开关。"""
+
+    def test_display_accepts_probe_reset_and_output_dir(self):
+        self.assertEqual(
+            _expand_subcommand(["display", "--reset", "--json"]),
+            ["--display-info", "--reset", "--json"],
+        )
+        self.assertEqual(
+            _expand_subcommand(["display", "--probe", "2.0", "--output-dir", "/tmp/x"]),
+            ["--display-info", "--probe", "2.0", "--output-dir", "/tmp/x"],
+        )
+
+    def test_display_probe_requires_value(self):
+        with self.assertRaises(ConfigError):
+            _expand_subcommand(["display", "--probe"])
+
+    def test_other_subcommands_reject_display_only_flags(self):
+        with self.assertRaises(ConfigError):
+            _expand_subcommand(["doctor", "--reset"])
+
+    def test_capture_is_passthrough(self):
+        self.assertEqual(
+            _expand_subcommand(["capture", "--from", "1", "--output-dir", "/tmp/x", "--display", "wide"]),
+            ["--capture", "--from", "1", "--output-dir", "/tmp/x", "--display", "wide"],
+        )
+
+    def test_modules_subcommand_maps_to_flag(self):
+        self.assertEqual(_expand_subcommand(["modules", "--json"]), ["--list-modules", "--json"])
 
 
 if __name__ == "__main__":

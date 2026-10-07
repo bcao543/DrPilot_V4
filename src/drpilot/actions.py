@@ -266,11 +266,39 @@ def default_swipe_step(config: Any) -> Step:
     )
 
 
+def tap_step(config: Any) -> Step:
+    """手动点按坐标（config.tap_x / tap_y / tap_ms）-> 一条 tap 步骤。"""
+    return Step(
+        kind="tap",
+        x=int(getattr(config, "tap_x", 0) or 0),
+        y=int(getattr(config, "tap_y", 0) or 0),
+        duration_ms=max(0, int(getattr(config, "tap_ms", 80) or 0)),
+        absolute=True,
+    )
+
+
 def build_next_action(config: Any) -> list[Step]:
-    """录制动作优先；没有录制动作时退回旧的固定滑动。"""
+    """按 config.page_action 决定这次翻页用哪一种动作。
+
+    * auto（CLI 默认）：录制动作优先，其次手动点按坐标，最后退回固定滑动 —— 与旧版一致；
+    * tap / swipe / record：GUI「翻页动作」窗口里明确选中的一种，选了就只用它
+      （tap 没填坐标 / record 没录过动作时，退回固定滑动，并在日志里说明）。
+    """
+    kind = str(getattr(config, "page_action", "auto") or "auto").strip().lower()
     steps = normalize_steps(getattr(config, "next_action", None))
+    tap = tap_step(config)
+    has_tap = tap.x > 0 and tap.y > 0
+
+    if kind == "swipe":
+        return [default_swipe_step(config)]
+    if kind == "tap":
+        return [tap] if has_tap else [default_swipe_step(config)]
+    if kind == "record":
+        return steps or [default_swipe_step(config)]
     if steps:
         return steps
+    if has_tap:
+        return [tap]
     return [default_swipe_step(config)]
 
 
@@ -903,4 +931,5 @@ __all__ = [
     "replay_next_action",
     "steps_summary",
     "steps_to_payload",
+    "tap_step",
 ]

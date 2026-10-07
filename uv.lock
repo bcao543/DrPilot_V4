@@ -97,7 +97,7 @@ wheels = [
 
 [[package]]
 name = "drpilot-v4"
-version = "4.0.0"
+version = "4.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

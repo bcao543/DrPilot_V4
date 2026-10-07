@@ -55,6 +55,13 @@ PROMPT_SPECS: tuple[dict[str, Any], ...] = (
         "kind": "str",
         "required": False,
     },
+    # 追加在最后：不影响既有提问顺序
+    {
+        "dest": "modules_text",
+        "prompt": "还要额外提取哪些模块？（如 考点还原、标准解析，逗号分隔；不需要直接回车）",
+        "kind": "str",
+        "required": False,
+    },
 )
 
 MAX_ATTEMPTS = 3

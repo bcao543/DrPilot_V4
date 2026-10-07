@@ -1,6 +1,6 @@
 [project]
 name = "drpilot-v4"
-version = "4.0.0"
+version = "4.2.0"
 description = "ADB 滑动截图 + AI 题目识别，导出 JSON/Markdown，含命令行与图形界面"
 readme = "README.md"
 requires-python = ">=3.13"

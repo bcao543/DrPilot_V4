@@ -1,0 +1,31 @@
+/* 「屏幕调节」窗口：左边原本、右边调节后（只做预览，不能拖），下面三个滑块 + 输入框 */
+
+.tuner-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:var(--gap);
+  min-height:0;
+}
+.tuner-grid>.span-2{grid-column:1 / -1;}
+
+/* 舞台：两块一样大，手机矩形都从左上角长出来，比例一致才好比较 */
+.stage{
+  position:relative;overflow:hidden;border-radius:var(--r-md);
+  background:var(--surface-deep);
+  box-shadow:inset 2px 2px 6px var(--sh-dark),inset -2px -2px 6px var(--sh-light);
+  height:clamp(190px, 40vh, 400px);
+}
+.phone{
+  position:absolute;left:14px;top:14px;
+  background:#fff;border-radius:8px;overflow:hidden;
+  border:2px solid rgba(59,130,246,.55);
+  box-shadow:3px 3px 10px var(--sh-dark);
+  transition:width .06s linear,height .06s linear;
+}
+.phone img{width:100%;height:100%;object-fit:fill;display:block;background:
+  linear-gradient(135deg, rgba(0,0,0,.03) 25%, transparent 25%, transparent 50%,
+  rgba(0,0,0,.03) 50%, rgba(0,0,0,.03) 75%, transparent 75%) 0 0/18px 18px;}
+#phone-a{border-color:rgba(120,130,150,.45);transition:none;}
+
+.slider-row>.slider-name{min-width:30px;}
+.slider-row input[type=range]{max-width:520px;}
+#warn-note{margin-top:2px;}
+#request-note{white-space:nowrap;}

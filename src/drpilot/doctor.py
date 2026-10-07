@@ -29,6 +29,7 @@ from .config import (
 )
 from .errors import ConfigError
 from .keys import mask_keys
+from .modules import module_names, modules_summary, normalize_modules
 
 REQUIRED_PYTHON = (3, 13)
 # 运行必需的第三方依赖（缺哪个都会在跑起来之后才炸，所以提前查）
@@ -281,10 +282,25 @@ def _config_check(
                 "常见修法：\n"
                 "- 缺题号范围：加 --from 47 --to 81（题号以截图右上角为准）；\n"
                 "- 缺输出目录：加 --output-dir D:\\题库；\n"
-                "- 模型/地址为空：加 --model Qwen/Qwen3.5-4B --base-url https://api.siliconflow.cn/v1。"
+                "- 模型/地址为空：加 --model deepseek-flash --base-url https://api.deepseek.com，"
+                "或在 GUI「模型服务」窗口里填（默认就是这两个值）。"
             ),
             data={"path": used_path},
         )
+    try:
+        specs = normalize_modules(config.modules, strict=True)
+    except ConfigError as exc:
+        return CheckResult(
+            "config",
+            STATUS_FAIL,
+            f"提取模块配置有误：{exc}",
+            hint=(
+                "模块名不能为空、不能与题目固定字段（id/stem/options/answer…）重名、也不能互相重复。\n"
+                "跑 drpilot modules --json 可以看到可用模块目录与正确写法。"
+            ),
+            data={"path": used_path, "modules": config.modules},
+        )
+
     warning = ""
     if not config.textbook and not config.chapter:
         warning = "；未设置教材/章节，文件名会退化为 题目_起-止，且缺少元数据"
@@ -293,9 +309,30 @@ def _config_check(
     detail = f"题号 {config.page_from}-{config.page_to}（共 {config.total} 题），模型 {config.model}"
     if used_path:
         detail += f"，配置来自 {used_path}"
-    detail += warning
+    if specs:
+        detail += f"；提取模块：{modules_summary(specs)}"
+    hint = ""
+    if warning:
+        hint = "建议补上 --textbook / --chapter，导出的 JSONL 每行都会带上教材章节信息。"
+    if config.uses_display_override:
+        if config.display_scale > 1:
+            what = f"加长主屏 {config.display_scale} 倍"
+            if config.display_width_scale > 1.0:
+                what += f"，加宽 {config.display_width_scale} 倍"
+            if config.display_density:
+                what += f"（密度 {config.display_density}）"
+        elif config.display_width_scale > 1.0:
+            what = f"只加宽 {config.display_width_scale} 倍"
+            if config.display_density:
+                what += f"，密度 {config.display_density}"
+        else:
+            what = f"只改显示密度 {config.display_density}（字变小、一屏装更多）"
+        detail += f"；{what}，运行时会临时改显示设置、结束或异常都会自动复位"
+        hint = (
+            "显示设置会被临时改动（wm size / wm density）：程序在成功结束与异常退出时都会复位；"
+            "若进程被强杀留下覆盖，执行 drpilot display --reset 恢复。"
+        )
     status = STATUS_WARN if warning else STATUS_OK
-    hint = "建议补上 --textbook / --chapter，导出的 JSONL 每行都会带上教材章节信息。" if warning else ""
     return CheckResult(
         "config",
         status,
@@ -307,6 +344,10 @@ def _config_check(
             "model": config.model,
             "base_url": config.base_url,
             "path": used_path,
+            "modules": module_names(specs),
+            "display_mode": config.display_mode,
+            "display_scale": config.display_scale,
+            "display_width_scale": config.display_width_scale,
         },
     )
 
@@ -349,16 +390,38 @@ def default_adb_probe(config: AppConfig) -> tuple[str, str, str]:
                 "- USB：换数据线/换口，授权弹窗要选允许。"
             ),
         )
+    from .display import parse_size_lines
+
+    status = STATUS_OK
+    hint = ""
     for device in ready:
         try:
-            size = AdbClient(
+            probe = AdbClient(
                 adb_path=client.adb_path, serial=device.serial, timeout=15.0
             ).wm_size()
         except Exception:
-            size = None
-        if size:
-            lines.append(f"{device.serial} 分辨率：{size[0]}x{size[1]}")
-    return STATUS_OK, "；".join(item for item in lines if item), ""
+            probe = None
+        if probe:
+            lines.append(f"{device.serial} 分辨率：{probe[0]}x{probe[1]}")
+        # 加长主屏/显示覆盖率残留检测：这是「上次没复位」最直观的信号
+        try:
+            raw = AdbClient(
+                adb_path=client.adb_path, serial=device.serial, timeout=15.0
+            ).wm_size_output()
+        except Exception:
+            raw = ""
+        sizes = parse_size_lines(raw)
+        override = sizes.get("override")
+        if override:
+            status = STATUS_WARN
+            lines.append(
+                f"⚠ {device.serial} 有显示覆盖 {override[0]}x{override[1]}（可能是上次加长屏没复位）"
+            )
+            hint = (
+                "执行 drpilot display --reset 可恢复正常分辨率；"
+                "下次用 --display wide 时程序会自动复位。"
+            )
+    return status, "；".join(item for item in lines if item), hint
 
 
 def _adb_check(config: AppConfig, probe: AdbProbe) -> CheckResult:

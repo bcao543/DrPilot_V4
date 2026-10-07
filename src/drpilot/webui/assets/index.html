@@ -30,7 +30,7 @@
     <div class="workers" id="worker-chips"></div>
   </section>
 
-  <!-- 参数区（自适应高度）+ 日志（吸收剩余高度）：两边都不会出现大片空白 -->
+  <!-- 主页面只放「每次都要改」的三块；其余设置点入口卡片，在独立窗口里配 -->
   <div class="workspace">
     <main class="grid">
       <div class="col">
@@ -86,46 +86,16 @@
       </div>
 
       <div class="col">
-        <section class="card" id="card-model">
-          <div class="card-head">
-            <h2>模型服务</h2><span class="hint" id="model-note">开始前自动自检</span>
-            <span class="spacer"></span>
-            <button class="btn small" id="btn-test-model">测试连通性</button>
-          </div>
-          <div class="rows">
-            <div class="row">
-              <label class="field grow"><span>模型 ID</span><input id="model" placeholder="平台上的模型 ID"></label>
-              <label class="field grow"><span>API 地址</span><input id="base_url" placeholder="https://api.example.com/v1"></label>
-            </div>
-            <div class="row">
-              <label class="field grow"><span>API Key</span>
-                <span class="secret">
-                  <input id="api_key_input" type="password" autocomplete="new-password"
-                    autocapitalize="off" autocorrect="off" spellcheck="false"
-                    placeholder="粘贴新 Key（可多行 / 逗号分隔），回车即新增">
-                  <button class="btn icon" id="btn-toggle-key" type="button"
-                    title="隐私输入模式：点眼睛临时显示/隐藏你输入的内容"
-                    aria-label="显示或隐藏输入的 API Key"><span id="key-eye">👁</span></button>
-                </span>
-              </label>
-              <button class="btn small primary" id="btn-add-key">＋ 新增 API Key</button>
-            </div>
-            <div class="row keys-line">
-              <span class="hint" id="key-info">正在读取 API Key…</span>
-              <span class="spacer"></span>
-              <button class="btn small ghost hidden" id="btn-clear-keys">全部删除</button>
-            </div>
-            <div class="key-chips" id="key-chips"></div>
-          </div>
-        </section>
-
         <section class="card">
-          <div class="card-head"><h2>识别与输出</h2><span class="hint">次要参数</span></div>
+          <div class="card-head">
+            <h2>识别与输出</h2><span class="hint">批大小 / 并发 / 等待 / 产物开关</span>
+          </div>
           <div class="rows">
             <div class="row">
               <label class="field"><span>批大小</span><input id="batch_size" class="w-xs num" placeholder="3"></label>
               <label class="field"><span>并发</span><input id="workers" class="w-xs num" placeholder="2"><em class="key-hint" id="workers-hint"></em></label>
               <label class="field"><span>翻页等待</span><input id="wait_ms" class="w-sm num" placeholder="1000"><em>ms</em></label>
+              <label class="field"><span>最大 token</span><input id="max_tokens" class="w-sm num" placeholder="4096"></label>
             </div>
             <div class="row switches">
               <label class="switch"><input type="checkbox" id="opt-md" checked><span class="track"><span class="knob"></span></span><span>生成 Markdown</span></label>
@@ -137,63 +107,35 @@
             </div>
           </div>
         </section>
-      </div>
 
-      <section class="card collapsible span-2" id="card-swipe">
-        <div class="card-head clickable" id="swipe-head">
-          <h2>翻页动作（点击 / 滑动）</h2><span class="hint">可录制，换机型自动缩放</span>
-          <span class="spacer"></span>
-          <button class="btn small ghost" id="btn-swipe-toggle">展开 ▾</button>
-        </div>
-        <div class="rows hidden" id="swipe-body">
-          <input type="hidden" id="next_action" value="">
-          <div class="row action-bar">
-            <button class="btn small" id="btn-record-start">开始录制</button>
-            <button class="btn small" id="btn-record-stop">停止录制</button>
-            <button class="btn small" id="btn-test-action">试一次</button>
-            <button class="btn small ghost" id="btn-action-clear">清除动作</button>
-            <span class="hint" id="action-status">未设置：将使用下方手动滑动坐标</span>
+        <section class="card" id="card-entries">
+          <div class="card-head">
+            <h2>入口</h2><span class="hint">点一下打开独立设置窗口（与主页面实时同步）</span>
           </div>
-          <div class="row"><ol class="action-steps" id="action-steps"></ol></div>
-          <div class="swipe-groups">
-            <div class="swipe-group">
-              <span class="group-label">手动点按（不支持录制时用）</span>
-              <div class="row">
-                <label class="field"><em>X</em><input id="action_tap_x" class="w-xs num" placeholder="X"></label>
-                <label class="field"><em>Y</em><input id="action_tap_y" class="w-xs num" placeholder="Y"></label>
-                <label class="field"><em>按住</em><input id="action_tap_ms" class="w-xs num" placeholder="80"><em>ms</em></label>
-                <button class="btn small" id="btn-use-tap">用这个坐标做点按</button>
-              </div>
-            </div>
-            <div class="swipe-group">
-              <span class="group-label">手动滑动（无录制时使用）</span>
-              <div class="row">
-                <span class="group-label">起点</span>
-                <label class="field"><em>X</em><input id="swipe_x1" class="w-xs num" placeholder="X"></label>
-                <label class="field"><em>Y</em><input id="swipe_y1" class="w-xs num" placeholder="Y"></label>
-                <span class="group-label">终点</span>
-                <label class="field"><em>X</em><input id="swipe_x2" class="w-xs num" placeholder="X"></label>
-                <label class="field"><em>Y</em><input id="swipe_y2" class="w-xs num" placeholder="Y"></label>
-              </div>
-              <div class="row">
-                <label class="field"><span>时长</span><input id="swipe_duration" class="w-xs num" placeholder="150"><em>ms</em></label>
-                <label class="field"><span>重试</span><input id="swipe_retries" class="w-xs num" placeholder="5"></label>
-                <label class="field"><span>等待</span><input id="swipe_retry_wait" class="w-xs num" placeholder="1.2"><em>s</em></label>
-              </div>
-            </div>
-            <div class="swipe-group">
-              <span class="group-label">基准分辨率（换机型时自动缩放坐标）</span>
-              <div class="row">
-                <label class="field grow"><input id="swipe_reference" placeholder="留空 = 首次运行自动记录"></label>
-              </div>
-              <div class="row">
-                <button class="btn small" id="btn-set-reference">设为当前设备</button>
-                <button class="btn small" id="btn-test-swipe">试滑一次</button>
-              </div>
-            </div>
+          <div class="entries">
+            <button type="button" class="entry" id="entry-action" data-panel="action">
+              <span class="entry-icon">翻</span>
+              <span class="entry-main"><span class="entry-name">翻页动作</span><span class="entry-note" id="note-action">读取中…</span></span>
+              <span class="entry-go">打开 ›</span>
+            </button>
+            <button type="button" class="entry" id="entry-modules" data-panel="modules">
+              <span class="entry-icon">提</span>
+              <span class="entry-main"><span class="entry-name">提取模块</span><span class="entry-note" id="note-modules">读取中…</span></span>
+              <span class="entry-go">打开 ›</span>
+            </button>
+            <button type="button" class="entry" id="entry-model" data-panel="model">
+              <span class="entry-icon">模</span>
+              <span class="entry-main"><span class="entry-name">模型服务</span><span class="entry-note" id="note-model">读取中…</span></span>
+              <span class="entry-go">打开 ›</span>
+            </button>
+            <button type="button" class="entry" id="entry-tuner" data-panel="tuner">
+              <span class="entry-icon">屏</span>
+              <span class="entry-main"><span class="entry-name">屏幕调节</span><span class="entry-note" id="note-tuner">读取中…</span></span>
+              <span class="entry-go">打开 ›</span>
+            </button>
           </div>
-        </div>
-      </section>
+        </section>
+      </div>
     </main>
 
     <section class="card log-card">
@@ -208,6 +150,32 @@
         <div class="log" id="log"></div>
       </div>
     </section>
+  </div>
+
+  <!-- 隐藏载体：四个设置窗口改完会回填到这里，开始提取时按这套值跑 -->
+  <div class="hidden">
+    <input id="model" type="hidden" value="">
+    <input id="base_url" type="hidden" value="">
+    <input id="page_action" type="hidden" value="auto">
+    <input id="next_action" type="hidden" value="">
+    <input id="action_tap_x" type="hidden" value="">
+    <input id="action_tap_y" type="hidden" value="">
+    <input id="action_tap_ms" type="hidden" value="80">
+    <input id="swipe_x1" type="hidden" value="">
+    <input id="swipe_y1" type="hidden" value="">
+    <input id="swipe_x2" type="hidden" value="">
+    <input id="swipe_y2" type="hidden" value="">
+    <input id="swipe_duration" type="hidden" value="">
+    <input id="swipe_retries" type="hidden" value="">
+    <input id="swipe_retry_wait" type="hidden" value="">
+    <input id="swipe_reference" type="hidden" value="">
+    <input id="extract_modules" type="hidden" value="">
+    <input id="output_fields" type="hidden" value="">
+    <input id="display_scale" type="hidden" value="1">
+    <input id="display_width_scale" type="hidden" value="1">
+    <input id="display_density" type="hidden" value="0">
+    <!-- 界面上不暴露：留一个复选框只是别把命令行设的 display_scaling 悄悄改回 auto -->
+    <input type="checkbox" id="opt-display-scaling" class="hidden">
   </div>
 
   <div class="overlay" id="overlay">

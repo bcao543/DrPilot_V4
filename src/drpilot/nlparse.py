@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
+from .modules import PRESETS
+
 # 题号区间：47到81 / 第47-81题 / 47~81 / 47 至 81
 _RANGE_RE = re.compile(
     r"(?:第)?\s*(\d{1,4})\s*(?:题)?\s*(?:到|至|~|～|-|－|—|–)\s*(?:第)?\s*(\d{1,4})\s*题?"
@@ -44,6 +46,15 @@ _CHAPTER_TAIL_RE = re.compile(r"(的?题目?|的?内容|的?题|的)$")
 _DRY_RUN_HINTS = ("先别跑", "先不要跑", "别真的跑", "不要真的跑", "只看配置", "先看看", "看看配置", "试跑", "dry-run", "dry run")
 _FORCE_HINTS = ("强制", "force", "不管题号", "忽略预检")
 
+# 提取模块：必须同时命中「模块词」和「触发词」才认，宁可少解析也不要解析错
+_MODULE_HINTS = ("提取", "要", "带", "包括", "包含", "连", "还有", "以及", "额外", "需要", "加上", "module")
+_MODULE_NEGATIONS = ("不要", "不用", "不需要", "别", "去掉", "除了", "没有", "只看")
+
+# 加长主屏：开启 / 关闭的说法
+_DISPLAY_ON_HINTS = ("加长屏", "加长主屏", "加长屏幕", "拉长屏幕", "长屏", "wide", "一次截全", "整页截图")
+_DISPLAY_OFF_HINTS = ("不要加长", "不用加长", "别动显示", "不要改显示", "不改显示", "保持原样")
+_SCALE_RE = re.compile(r"([0-9]+(?:.[0-9]+)?)[ ]*倍")
+
 
 def _clean_chapter_tail(name: str) -> str:
     text = name.strip()
@@ -54,10 +65,47 @@ def _clean_chapter_tail(name: str) -> str:
         text = trimmed
 
 
+def find_modules(text: str) -> list[str]:
+    """从一句话里找出用户点名要提取的模块（需要触发词，且排除否定说法）。
+
+    例：「要考点还原和标准解析」-> ["考点还原", "标准解析"]；
+        「不要解析」-> []。
+    """
+    raw = str(text or "")
+    if not raw:
+        return []
+    candidates: list[tuple[str, Any]] = []
+    for spec in PRESETS:
+        for key in [spec.name, *spec.aliases]:
+            if key:
+                candidates.append((key, spec))
+    # 长词优先，避免「解析」把「标准解析」拆掉
+    candidates.sort(key=lambda item: len(item[0]), reverse=True)
+
+    used = [False] * len(raw)
+    found: list[str] = []
+    for key, spec in candidates:
+        start = 0
+        while True:
+            index = raw.find(key, start)
+            if index < 0:
+                break
+            span = slice(index, index + len(key))
+            if not any(used[span]):
+                before = raw[max(0, index - 6):index]
+                if not any(word in before for word in _MODULE_NEGATIONS):
+                    used[span] = [True] * len(key)
+                    if spec.name not in found:
+                        found.append(spec.name)
+            start = index + len(key)
+    return found
+
+
 def parse_request(text: Any) -> dict[str, Any]:
     """解析一句自然语言，返回 {"params": {...}, "evidence": {...}}。
 
-    支持的参数：page_from / page_to / output_dir / textbook / chapter / device_address，
+    支持的参数：page_from / page_to / output_dir / textbook / chapter / device_address /
+    modules_text / display_mode / display_scale，
     以及 dry_run / force_start 两个布尔意图。解析不出来就不放进 params。
     """
     raw = "" if text is None else str(text)
@@ -120,6 +168,23 @@ def parse_request(text: Any) -> dict[str, Any]:
         host, port = address.group(1), address.group(2)
         take("device_address", f"{host}:{port}" if port else host, address.group(0))
 
+    module_hits = find_modules(raw)
+    if module_hits and any(hint in raw.lower() for hint in _MODULE_HINTS):
+        take("modules_text", ",".join(module_hits), "、".join(module_hits))
+
+    if any(hint in raw.lower() for hint in _DISPLAY_OFF_HINTS):
+        take("display_mode", "off", next(h for h in _DISPLAY_OFF_HINTS if h in raw))
+    elif any(hint in raw.lower() for hint in _DISPLAY_ON_HINTS):
+        take("display_mode", "wide", next(h for h in _DISPLAY_ON_HINTS if h in raw.lower()))
+        scale = _SCALE_RE.search(raw)
+        if scale:
+            try:
+                value = float(scale.group(1))
+            except ValueError:
+                value = 0.0
+            if 1.0 < value <= 4.0:
+                take("display_scale", value, scale.group(0))
+
     lowered = raw.lower()
     if any(hint in lowered for hint in _DRY_RUN_HINTS):
         take("dry_run", True, next(hint for hint in _DRY_RUN_HINTS if hint in lowered))
@@ -139,11 +204,20 @@ def describe_params(params: dict[str, Any]) -> str:
         ("textbook", lambda v: f"教材 {v}"),
         ("chapter", lambda v: f"章节 {v}"),
         ("device_address", lambda v: f"手机 {v}"),
+        ("modules_text", lambda v: f"模块 {v}"),
+        ("display_mode", lambda v: "加长主屏" if v == "wide" else "不加长屏幕"),
+        ("display_scale", lambda v: f"加长 {v} 倍"),
         ("dry_run", lambda v: "只校验（dry-run）"),
         ("force_start", lambda v: "强制继续"),
     ]
+    order = {
+        "page_from": 0, "page_to": 1, "output_dir": 2, "textbook": 3,
+        "chapter": 4, "device_address": 5, "modules_text": 6,
+        "display_mode": 7, "display_scale": 8, "dry_run": 9, "force_start": 10,
+    }
+    labels.sort(key=lambda item: order.get(item[0], 99))
     parts = [formatter(params[key]) for key, formatter in labels if key in params]
     return "；".join(parts)
 
 
-__all__ = ["describe_params", "parse_request"]
+__all__ = ["describe_params", "find_modules", "parse_request"]

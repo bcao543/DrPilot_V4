@@ -24,12 +24,14 @@ from .ai import (
     check_model_connection,
 )
 from .config import AppConfig, OutputPaths, resolve_output_paths
+from .display import ApplyResult, DisplayController, DisplayState
 from .errors import DrPilotError
 from .images import md5_hex, to_jpeg_base64
 from .models import Question
+from .modules import module_names, modules_summary, output_fields_summary
 from .output import ResultWriter
 from .parser import parse_ai_response, parse_screen_info
-from .prompts import PREFLIGHT_PROMPT, SYSTEM_PROMPT
+from .prompts import PREFLIGHT_PROMPT, build_system_prompt
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, int], None]
@@ -71,6 +73,7 @@ class PilotSession:
         image_encoder: Encoder | None = None,
         result_writer: ResultWriter | None = None,
         model_checker: ModelChecker | None = None,
+        display_controller: Any = None,
     ) -> None:
         self.config = config
         self.on_log = on_log or (lambda message: None)
@@ -105,6 +108,16 @@ class PilotSession:
         self._ai_factory = ai_factory
         self._encode = image_encoder
         self._writer = result_writer
+        self._display_controller = display_controller
+        # 加长主屏相关：capture_size 是 App 实际看到的逻辑尺寸（可能已被加长）
+        self.display: DisplayController | None = None
+        self.display_result: ApplyResult | None = None
+        self.display_state: DisplayState | None = None
+        self.capture_size: tuple[int, int] | None = None
+        self.system_prompt: str = ""
+        self.missing_modules: list[str] = []
+        # 翻页彻底失效（连续多次动作后画面还是同一张）时置位：停止截图，已识别的照常写盘
+        self.capture_stalled = False
         self._threads: list[threading.Thread] = []
         self._task_queue: "queue.Queue[tuple[int, list[tuple[str, int]]]] | None" = None
         self._result_store: dict[int, list[Question]] = {}
@@ -152,6 +165,10 @@ class PilotSession:
                 "error_context": dict(self.error_context),
                 "failed_question_numbers": failed,
                 "missing_question_numbers": list(self.missing_numbers),
+                "missing_modules": list(self.missing_modules),
+                "capture_stalled": bool(self.capture_stalled),
+                "modules": module_names(self.config.modules_specs),
+                "display": self.display_result.as_dict() if self.display_result else None,
                 "batch_failures": list(self.batch_failures)[-10:],
             }
 
@@ -236,14 +253,19 @@ class PilotSession:
         adb: AdbClient,
         previous_hash: str,
         last_encoded: str,
-    ) -> tuple[str, str]:
-        """重复截图时重试滑动；仍失败则接受当前帧，避免死循环。"""
+    ) -> tuple[str, str, bool]:
+        """重复截图时重试滑动，返回 (截图, 摘要, 是否卡住)。
+
+        仍然卡住时必须让调用方知道：以前这里是「接受当前帧继续」，结果同一张图被当成
+        下一题送进模型 —— 模型可能给同一张图编出两个题号（实测出现过第 4、5 题内容
+        完全一样），也可能少写一题。翻页没生效说明后面的题也截不到，继续跑没有意义。
+        """
         config = self.config
         if config.max_swipe_retries <= 0:
-            return last_encoded, previous_hash
+            return last_encoded, previous_hash, False   # 用户显式关掉重试：保持旧行为
         for attempt in range(1, config.max_swipe_retries + 1):
             if self.stop_event.is_set():
-                return last_encoded, previous_hash
+                return last_encoded, previous_hash, False
             if config.retry_wait > 0:
                 time.sleep(config.retry_wait)
             try:
@@ -255,9 +277,8 @@ class PilotSession:
             current_hash = md5_hex(encoded)
             if current_hash != previous_hash:
                 self.log(f"重试 {attempt} 成功")
-                return encoded, current_hash
-        self.log("多次重试仍重复，接受当前帧继续")
-        return last_encoded, previous_hash
+                return encoded, current_hash, False
+        return last_encoded, previous_hash, True
 
     def _make_client(self, api_key: str) -> Any:
         if self._ai_factory is not None:
@@ -271,6 +292,7 @@ class PilotSession:
             max_retries=config.max_retries,
             retry_delay=config.retry_delay,
             retry_backoff=config.retry_backoff,
+            max_tokens=config.max_tokens,
             log=self.log,
             deadline=config.effective_request_deadline,
         )
@@ -314,6 +336,69 @@ class PilotSession:
         screen_id, screen_total = parse_screen_info(text)
         return encoded, screen_id, screen_total
 
+    def _recover_missing(
+        self,
+        parsed: list[Question | None],
+        items: Sequence[tuple[str, int]],
+        numbers: Sequence[int],
+        worker_id: int,
+        batch_id: int,
+        client: Any,
+    ) -> list[Question | None]:
+        """模型一次没给全时逐张重问（多数是单次回复被 max_tokens 截断）。
+
+        实测反馈：同一张图在网页版能认出来，程序里却变成「[识别失败]」—— 根因是「一批 3 张的
+        回复被截断」，截断抢救只救回前 1~2 题。单张的回复长度只有批量的 1/N，几乎不会被截断，
+        所以这里对缺的槽位一张一张重问；仍然失败的才记成批次失败（Agent 能拿到补录命令）。
+        """
+        missing = [index for index, question in enumerate(parsed) if question is None]
+        if not missing:
+            return parsed
+        affected = [numbers[index] for index in missing if index < len(numbers)]
+        self.log(
+            f"[W{worker_id}] 批次 {batch_id}：模型只给出 {len(parsed) - len(missing)}/{len(parsed)} 题"
+            f"（常见原因是单次回复被 max_tokens 截断，涉及题号 {affected}）——正在逐张重问…"
+        )
+        system_prompt = self.system_prompt or build_system_prompt(self.config.modules_specs)
+        recovered = 0
+        still_missing: list[int] = []
+        for index in missing:
+            if index >= len(items):
+                break
+            encoded, number = items[index]
+            try:
+                text = client.complete(
+                    build_messages(system_prompt, [encoded]),
+                    meta=f"W{worker_id} 补题 {number}",
+                )
+                single = parse_ai_response(
+                    text, expected_count=1, modules=self.config.modules_specs
+                )
+            except Exception as exc:
+                self.log(f"[W{worker_id}] 第 {number} 题重问失败：{_short(exc, 160)}")
+                single = []
+            question = single[0] if single else None
+            if question is None:
+                still_missing.append(number)
+            else:
+                parsed[index] = question
+                recovered += 1
+        if recovered:
+            self.log(f"[W{worker_id}] 批次 {batch_id}：逐张重问救回 {recovered} 题")
+        if still_missing:
+            self.log(
+                f"[W{worker_id}] 批次 {batch_id}：题号 {still_missing} 单张重问仍未识别，先写占位；"
+                "建议把「最大 token」调大或批大小降到 1，再按题号补录"
+            )
+            self._record_failure(
+                worker_id,
+                batch_id,
+                still_missing,
+                "模型回复不完整（单张重问仍失败，多为 max_tokens 截断）",
+                phase="batch",
+            )
+        return parsed
+
     def _assign_questions(
         self,
         parsed: Sequence[Question | None],
@@ -348,6 +433,35 @@ class PilotSession:
                 question.id = expected
             questions.append(question)
         return questions
+
+    def _track_modules(
+        self,
+        questions: Sequence[Question],
+        worker_id: int,
+        batch_id: int,
+    ) -> None:
+        """记录「必读模块」缺失的题号：Agent 可以直接用它续跑补录。"""
+        specs = [spec for spec in self.config.modules_specs if spec.required]
+        if not specs or not questions:
+            return
+        missing = [
+            (spec.name, question.id)
+            for question in questions
+            if not question.is_placeholder
+            for spec in specs
+            if not question.modules.get(spec.name)
+        ]
+        if not missing:
+            return
+        names = "、".join(sorted({name for name, _ in missing}))
+        numbers = sorted({number for _, number in missing})
+        for name, _number in missing:
+            if name not in self.missing_modules:
+                self.missing_modules.append(name)
+        self.log(
+            f"[W{worker_id}] 批次 {batch_id}：题号 {numbers} 缺少必读模块（{names}）；"
+            "可对这几题重新提取补录"
+        )
 
     def _start_workers(
         self,
@@ -416,7 +530,7 @@ class PilotSession:
                     self.log(f"[W{worker_id}] 批次 {batch_id}，预期题号 {numbers}")
                     self.on_worker(worker_id, f"处理批次 {batch_id}")
                     messages = build_messages(
-                        SYSTEM_PROMPT,
+                        self.system_prompt or build_system_prompt(self.config.modules_specs),
                         [encoded for encoded, _ in items],
                     )
                     call_started = time.monotonic()
@@ -427,8 +541,14 @@ class PilotSession:
                             f"[W{worker_id}] 批次 {batch_id} 用了 {call_used:.0f}s"
                             "（模型慢或在排队：可换更快的模型，或调大 request_deadline）"
                         )
-                    parsed = parse_ai_response(text, expected_count=len(items))
+                    parsed = parse_ai_response(
+                        text,
+                        expected_count=len(items),
+                        modules=self.config.modules_specs,
+                    )
+                    parsed = self._recover_missing(parsed, items, numbers, worker_id, batch_id, client)
                     questions = self._assign_questions(parsed, numbers, worker_id, batch_id)
+                    self._track_modules(questions, worker_id, batch_id)
                 except Exception as exc:
                     short = _short(exc, 200)
                     self.log(
@@ -483,10 +603,19 @@ class PilotSession:
                 self.log(f"无线连接失败（改用已连接的设备）：{_short(exc, 200)}")
         self.device = adb.ensure_device()
         self.log(f"设备：{self.device.describe()}")
+
+        # ---- 加长主屏：先读物理尺寸，再按需要临时放大逻辑高度 ----
+        # 注意：wm size 改的是 App 看到的逻辑尺寸，而「翻页动作的基准分辨率」必须记物理尺寸。
+        # 实测加长屏下内容是顶部锚定的（选项 y 坐标不变），按逻辑高度换算会把 y 放大 1.5~2 倍。
+        self.display = self._display_controller or DisplayController(adb, log=self.log)
+        self.display_state = self.display.read_state(quick=True)
         try:
-            self.resolution = adb.wm_size()
+            logical = adb.wm_size()
         except Exception as exc:
+            logical = None
             self.log(f"读取分辨率失败：{exc}")
+        self.resolution = self.display_state.physical or logical
+        self.capture_size = logical
         if self.resolution:
             self.log(f"设备分辨率：{self.resolution[0]}x{self.resolution[1]}")
             if config.swipe_reference_width <= 0 or config.swipe_reference_height <= 0:
@@ -496,12 +625,78 @@ class PilotSession:
                     f"已自动记录滑动基准分辨率：{self.resolution[0]}x{self.resolution[1]}"
                     "（以后换机型会按此自动缩放）"
                 )
-        self.action_plan = build_action_plan(
-            build_next_action(config),
-            self._reference_size(),
-            self.resolution,
+
+        try:
+            self._apply_display(adb, config)
+            self.action_plan = build_action_plan(
+                build_next_action(config),
+                self._reference_size(),
+                self.resolution,
+            )
+            self.log(f"翻页动作：{self.action_plan.describe()}")
+            self._run_session(adb, total)
+        finally:
+            self._restore_display()
+
+    # ---- 加长主屏 ----
+    def _apply_display(self, adb: AdbClient, config: AppConfig) -> None:
+        """按配置临时加长逻辑屏；没启用时只记一行日志。"""
+        controller = self.display
+        if controller is None:
+            return
+        if not config.uses_display_override:
+            state = self.display_state or controller.read_state()
+            self.log(f"加长主屏：未启用（{state.describe()}）")
+            return
+        self.set_phase("display")
+        result = controller.apply(
+            scale=config.display_scale,
+            width_scale=config.display_width_scale,
+            density=config.display_density,
+            scaling=config.display_scaling,
+            screenshot=getattr(adb, "screenshot", None),
         )
-        self.log(f"翻页动作：{self.action_plan.describe()}")
+        self.display_result = result
+        self.log(result.describe())
+        if result.density_only:
+            if result.verified:
+                self.log(
+                    "只改了显示密度：截图尺寸仍是物理分辨率，翻页动作照旧"
+                    "（字变小了，一屏能多看点内容）"
+                )
+        elif result.verified and result.actual:
+            self.capture_size = result.actual
+            self.log(
+                "加长屏生效：翻页动作仍按物理分辨率换算（加长屏下内容顶部锚定，"
+                "按逻辑高度缩放会滑错位置）"
+            )
+        else:
+            self.log(
+                "[提示] 加长屏没生效，按原始分辨率继续；"
+                "可以先跑 drpilot display --probe 看看这台机器的上限"
+            )
+
+    def _restore_display(self) -> None:
+        """无论成功失败都要把手机显示设置还原（进程被强杀时用 display --reset 兜底）。"""
+        controller = self.display
+        if controller is None:
+            return
+        try:
+            controller.restore()
+        except Exception as exc:
+            self.log(f"[警告] 复位手机显示设置失败：{exc}（可执行 drpilot display --reset）")
+
+    def _run_session(self, adb: AdbClient, total: int) -> None:
+        config = self.config
+        modules = config.modules_specs
+        self.system_prompt = build_system_prompt(modules)
+        self.log(f"提取模块：{modules_summary(modules)}")
+        self.log(f"输出字段：{output_fields_summary(config.output_fields)}")
+        if modules and config.batch_size > 2:
+            self.log(
+                f"[提示] 已配置 {len(modules)} 个模块，输出会明显变长："
+                "建议 --batch-size 1~2，必要时调大 --max-tokens"
+            )
 
         # 并发按用户设置来；Key 不够时多个 worker 共用一个 Key（轮着用），只是可能触发限流
         key_count = max(1, len(config.api_keys))
@@ -558,7 +753,13 @@ class PilotSession:
         self.set_phase("prepare")
         self.paths = resolve_output_paths(config)
         Path(self.paths.jsonl).parent.mkdir(parents=True, exist_ok=True)
-        writer = self._writer or ResultWriter(self.paths, config.metadata(), log=self.log)
+        writer = self._writer or ResultWriter(
+            self.paths,
+            config.metadata(),
+            log=self.log,
+            modules=config.modules_specs,
+            output_fields=config.output_fields,
+        )
         if config.output_prefix:
             self.log(f"输出前缀：{config.output_prefix}")
         else:
@@ -587,7 +788,24 @@ class PilotSession:
                 current_hash = md5_hex(encoded)
                 if previous_hash is not None and current_hash == previous_hash:
                     self.log("检测到重复截图，重试翻页动作…")
-                    encoded, current_hash = self._next_action_until_changed(adb, previous_hash, encoded)
+                    encoded, current_hash, stuck = self._next_action_until_changed(
+                        adb, previous_hash, encoded
+                    )
+                    if stuck:
+                        # 不要再把同一张图当成下一题：那会写出「内容重复、题号不同」的脏数据
+                        self.log(
+                            f"[错误] 翻页失败：连续 {config.max_swipe_retries} 次动作后画面仍与上一张相同，"
+                            f"第 {expected} 题没截到。已停止继续截图（前面识别好的照常写入）"
+                        )
+                        self._record_failure(
+                            0,
+                            batch_id,
+                            [expected],
+                            "翻页失败：画面连续多次没有变化（App 没翻到下一题）",
+                            phase="capture",
+                        )
+                        self.capture_stalled = True
+                        break
                 previous_hash = current_hash
 
                 batch.append((encoded, expected))
@@ -614,6 +832,11 @@ class PilotSession:
                 self.log(f"[队列] 批次 {batch_id}：{len(batch)} 张")
 
         stopped_early = self.stop_event.is_set()
+        if self.capture_stalled:
+            self.log(
+                f"截图中断：翻页动作失效（最后一次成功的是第 {max(0, expected - 1)} 题之前的内容），"
+                "已识别的部分照常写盘；请检查「翻页动作」后按题号补录"
+            )
         if stopped_early:
             self.log("已停止截图，等待进行中的批次处理完…")
         else:

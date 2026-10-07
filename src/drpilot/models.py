@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from .modules import ModuleSpec, match_module_name
+
 OPTION_LETTERS = "ABCDEFGH"
 TYPE_SINGLE = "single"
 TYPE_MULTI = "multi"
@@ -86,6 +88,46 @@ def _optional_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
+def normalize_modules_map(value: Any) -> dict[str, str]:
+    """把模块字段统一成 {模块名: 正文}，丢掉空值。"""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for raw_key, raw_val in value.items():
+        key = str(raw_key or "").strip()
+        text = "" if raw_val is None else str(raw_val).strip()
+        if key and text:
+            result[key] = text
+    return result
+
+
+def extract_modules(data: Mapping[str, Any], specs: Sequence[ModuleSpec] | None = None) -> dict[str, str]:
+    """从 AI 返回的元素里取出模块正文。
+
+    同时兼容两种写法：
+        * 模块与 stem/answer 平级：{"考点还原": "…"}
+        * 收在 modules 对象里：{"modules": {"考点还原": "…"}}
+    配了模块清单时，名字/别名都会归一到规范模块名。
+    """
+    found: dict[str, str] = {}
+    nested = normalize_modules_map(data.get("modules"))
+    for key, value in nested.items():
+        name = match_module_name(specs, key) if specs else None
+        found[name or key] = value
+    if specs:
+        for spec in specs:
+            for key, value in data.items():
+                if not isinstance(key, str) or key == "modules":
+                    continue
+                if not spec.matches(key):
+                    continue
+                text = "" if value is None else str(value).strip()
+                if text:
+                    found[spec.name] = text
+                break
+    return found
+
+
 @dataclass
 class Question:
     """一道题。"""
@@ -95,6 +137,8 @@ class Question:
     stem: str = ""
     options: dict[str, str] = field(default_factory=dict)
     answer: str = ""
+    # 用户自定义的提取模块（考点还原 / 标准解析 …）：{模块名: 正文}
+    modules: dict[str, str] = field(default_factory=dict)
     # AI 从截图上读到的题号/总题数，仅用于校验与纠错，不写入 JSONL 的固定五字段
     screen_id: int | None = None
     screen_total: int | None = None
@@ -108,23 +152,38 @@ class Question:
         self.stem = "" if self.stem is None else str(self.stem).strip()
         self.options = normalize_options(self.options)
         self.answer = normalize_answer(self.answer)
+        self.modules = normalize_modules_map(self.modules)
         self.screen_id = _optional_int(self.screen_id)
         self.screen_total = _optional_int(self.screen_total)
         return self
 
     def to_dict(self) -> dict[str, Any]:
-        """题目本身的五个字段（教材/章节元数据由 writer 追加）。"""
-        return {
+        """题目本身的字段（教材/章节元数据由 writer 追加）。
+
+        modules 为空时不写这个键 —— 保证不用模块的用户，输出与旧版逐字节一致。
+        """
+        data: dict[str, Any] = {
             "id": self.id,
             "type": self.type,
             "stem": self.stem,
             "options": dict(self.options),
             "answer": self.answer,
         }
+        if self.modules:
+            data["modules"] = dict(self.modules)
+        return data
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "Question":
-        """宽容地从任意 dict 构造。"""
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        modules: Sequence[ModuleSpec] | None = None,
+    ) -> "Question":
+        """宽容地从任意 dict 构造。
+
+        modules 是本次运行的模块清单：给了就会把「考点还原」这类自定义键收进
+        Question.modules（别名也算），不给则只认固定字段。
+        """
         if not isinstance(data, Mapping):
             raise TypeError("题目必须是对象")
         q = cls(
@@ -144,6 +203,7 @@ class Question:
                 else data.get("total", data.get("total_questions", data.get("total_count")))
             ),
         )
+        q.modules = extract_modules(data, modules)
         return q.normalize()
 
     @classmethod

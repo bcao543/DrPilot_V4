@@ -383,6 +383,38 @@ class AdbClient:
             return None
         return self.parse_wm_size(output)
 
+    # ---- 显示覆盖（加长主屏）----
+    # 这些命令故意 check=False：设备可能静默忽略过大的尺寸，
+    # 成败一律以「回读 wm size」为准（见 display.py）。
+    def wm_size_output(self) -> str:
+        """`wm size` 的原始输出（含 Physical size / Override size 两行）。"""
+        return str(self.run(["shell", "wm", "size"], check=False) or "")
+
+    def wm_density_output(self) -> str:
+        """`wm density` 的原始输出。"""
+        return str(self.run(["shell", "wm", "density"], check=False) or "")
+
+    def set_wm_size(self, width: int, height: int) -> str:
+        """临时覆盖逻辑分辨率（加长主屏的核心命令）。"""
+        return str(self.run(["shell", "wm", "size", f"{int(width)}x{int(height)}"], check=False) or "")
+
+    def reset_wm_size(self) -> str:
+        return str(self.run(["shell", "wm", "size", "reset"], check=False) or "")
+
+    def set_wm_density(self, density: int) -> str:
+        return str(self.run(["shell", "wm", "density", str(int(density))], check=False) or "")
+
+    def reset_wm_density(self) -> str:
+        return str(self.run(["shell", "wm", "density", "reset"], check=False) or "")
+
+    def set_wm_scaling(self, mode: Any) -> str:
+        """`wm scaling off|auto`：off = 物理屏 1:1 裁剪，不再压扁显示。"""
+        return str(self.run(["shell", "wm", "scaling", str(mode)], check=False) or "")
+
+    def window_displays_dump(self) -> str:
+        """`dumpsys window displays`：用来读 noscale 等显示状态。"""
+        return str(self.run(["shell", "dumpsys", "window", "displays"], check=False) or "")
+
     @staticmethod
     def parse_wm_size(output: str) -> tuple[int, int] | None:
         override: tuple[int, int] | None = None
