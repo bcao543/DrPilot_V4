@@ -57,6 +57,26 @@ window.DrPilotPanel = (function () {
     setTimeout(() => waitForBackend(boot, deadline), 80);
   }
 
+  /* 入口窗口专用：pywebview 的 API 是异步注入的（注入完才发 pywebviewready），
+     DOMContentLoaded 时 backend() 往往还是 null。直接据此进预览模式，
+     窗口就会永远停在「示例（预览模式）」（截图里就是这个现象）。
+     init：后端可用时调用；demo：确实没有后端（浏览器直开）时才调用。 */
+  function bootPanel(init, demo) {
+    let started = false;
+    function start() {
+      if (started) return;
+      started = true;
+      if (!backend()) {
+        if (demo) demo();
+        return;
+      }
+      init();
+    }
+    const deadline = Date.now() + 2500;
+    window.addEventListener("pywebviewready", () => waitForBackend(start, deadline));
+    waitForBackend(start, deadline);
+  }
+
   function num(id, fallback) {
     const el = $(id);
     const value = Number(el ? el.value : fallback);
@@ -93,7 +113,7 @@ window.DrPilotPanel = (function () {
   }
 
   return {
-    $, backend, preview, toast, call, startPoll, waitForBackend,
+    $, backend, preview, toast, call, startPoll, waitForBackend, bootPanel,
     num, setValue, setText, bindSwitch, debounce,
   };
 })();

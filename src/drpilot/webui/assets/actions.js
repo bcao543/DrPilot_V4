@@ -205,12 +205,11 @@
   function boot() {
     bind();
     renderKind();
-    if (!P.backend()) { demo(); return; }
-    P.waitForBackend(async () => {
+    P.bootPanel(async () => {
       const state = await P.call("ready");
       if (state) applyState(state);
       P.startPoll(applyState, 250);
-    }, Date.now() + 2500);
+    }, demo);
   }
 
   document.addEventListener("DOMContentLoaded", boot);

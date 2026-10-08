@@ -315,12 +315,11 @@
   function boot() {
     bind();
     computeMetrics();
-    if (!P.backend()) { demo(); return; }
-    P.waitForBackend(async () => {
+    P.bootPanel(async () => {
       const s = await P.call("ready");
       if (s) applyState(s);
       P.startPoll(applyState, 250);
-    }, Date.now() + 2500);
+    }, demo);
   }
 
   document.addEventListener("DOMContentLoaded", boot);

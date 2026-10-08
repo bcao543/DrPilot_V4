@@ -271,7 +271,12 @@ ACTIONS_MOCK = r"""
         return Promise.resolve((replies[name] || function () { return { ok: true }; }).apply(null, args));
       };
     });
-  window.pywebview = { api: api };
+  // 模拟 pywebview 的异步注入：DOMContentLoaded 时 window.pywebview 还不存在，
+  // 250ms 后才注入并派发 pywebviewready。窗口必须等它，不能直接掉进预览模式。
+  setTimeout(function () {
+    window.pywebview = { api: api };
+    window.dispatchEvent(new Event("pywebviewready"));
+  }, 250);
 })();
 """
 
@@ -300,6 +305,8 @@ function setValue(id, value) {
 
 async function run() {
   await sleep(700);
+  window.__notPreview = ((document.getElementById("pill-device-text") || {}).textContent || "")
+    .indexOf("预览模式") < 0;
   window.__initialCard = visible("card-swipe") && !visible("card-tap") && !visible("card-record");
   // 三选一：点「点按」应只显示点按参数
   const tapChoice = document.querySelector('.choice[data-kind="tap"]');
@@ -365,6 +372,7 @@ setTimeout(function () {
     pre.id = "selftest";
     pre.textContent = "CALLS=" + JSON.stringify(window.__calls) +
       "\nERRORS=" + JSON.stringify(window.__errors) +
+      "\nBACKEND_CONNECTED=" + String(window.__notPreview) +
       "\nINITIAL_CARD=" + String(window.__initialCard) +
       "\nTAP_CARD=" + String(window.__tapCard) +
       "\nRECORD_CARD=" + String(window.__recordCard) +
@@ -859,6 +867,7 @@ PAGES: list[dict] = [
         "expected": ["ready", "poll", "apply", "test", "set_reference",
                      "start_record", "stop_record", "clear_recorded"],
         "flags": [
+            ("BACKEND_CONNECTED", "true", None, "后端异步注入时窗口没等待，掉进了预览模式"),
             ("INITIAL_CARD", "true", None, "打开时没有按当前设置显示参数卡片"),
             ("TAP_CARD", "true", None, "选「点按」没有只显示点按参数"),
             ("RECORD_CARD", "true", None, "选「录制动作」没有只显示录制卡片"),
