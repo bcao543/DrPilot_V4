@@ -16,6 +16,7 @@
   let refDirty = false;       // 基准分辨率单独记：点「设为当前设备」后要能接住后端读回的值
   let recording = false;
   let running = false;
+  let testing = false;        // 「试一次」进行中：按钮先禁用，避免连点两个线程同时翻页
 
   function setPill(text, tone) {
     const pill = $("pill-device");
@@ -81,6 +82,7 @@
     setPill(s.device || "", "");
     recording = !!s.recording;
     running = !!s.running;
+    testing = !!s.testing;
     if (!dirty) {
       kind = s.kind || "swipe";
       renderKind();
@@ -117,10 +119,16 @@
     box.style.color = notice.tone === "err" ? "var(--red)"
       : (notice.tone === "warn" ? "var(--amber)" : (notice.tone === "ok" ? "var(--green)" : "var(--muted)"));
 
-    $("btn-record-start").disabled = recording || running;
-    $("btn-record-stop").disabled = !recording;
+    // 录制用一个按钮切换：开始录制 ⇄ 结束录制
+    const toggle = $("btn-record-toggle");
+    if (toggle) {
+      toggle.textContent = recording ? "结束录制" : "开始录制";
+      toggle.classList.toggle("danger", recording);
+      toggle.disabled = running;      // 录制中仍可点它结束
+    }
     $("btn-record-clear").disabled = recording || running || !(record.steps || []).length;
-    $("btn-test").disabled = recording || running;
+    $("btn-test").textContent = testing ? "测试中…" : "试一次";
+    $("btn-test").disabled = recording || running || testing;
     $("btn-apply").disabled = recording || running;
     $("btn-set-reference").disabled = running;
   }
@@ -155,13 +163,17 @@
       else P.toast("正在读取设备分辨率…", "");
       refDirty = false;      // 让后端读回的基准分辨率能显示出来
     };
-    $("btn-record-start").onclick = async () => {
+    $("btn-record-toggle").onclick = async () => {
+      if (recording) {
+        await P.call("stop_record");
+        P.toast("正在结束录制…", "");
+        return;
+      }
       const res = await P.call("start_record", collect());
       if (res && res.ok === false) { P.toast(res.error || "开始录制失败", "err"); return; }
       dirty = false;
       P.toast("开始录制：请在手机上做一次「下一题」", "");
     };
-    $("btn-record-stop").onclick = () => P.call("stop_record");
     $("btn-record-clear").onclick = async () => {
       if (!window.confirm("确定清除已录制的动作吗？\n（点按 / 滑动参数不受影响）")) return;
       const res = await P.call("clear_recorded");

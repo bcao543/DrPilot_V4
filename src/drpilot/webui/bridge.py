@@ -369,6 +369,8 @@ class UiBridge:
         self._question_seq = 0
         self._record_stop = threading.Event()
         self._record_thread: threading.Thread | None = None
+        # 「试一次」同一时刻只跑一个：连点两下会两个线程同时截图/翻页，结果必错
+        self._action_test_thread: threading.Thread | None = None
         # 实时屏幕调节（滑块）：同一时刻只跑一次「设置手机显示」，中间值直接丢掉
         self._display_lock = threading.Lock()
         self._display_seq = 0
@@ -1235,6 +1237,13 @@ class UiBridge:
             self._toast(str(exc), "err")
             return {"ok": False, "error": str(exc)}
         self._record_stop.clear()
+        # 一开始录制就把翻页方式切到「录制动作」：录完直接开始提取也能用上，
+        # 不会因为之前选的是「滑动」而继续用固定坐标。
+        self._config.page_action = "record"
+        panel = dict(self._panel_state.get("action") or {})
+        panel["kind"] = "record"
+        self._panel_state["action"] = panel
+        self._patch_form(page_action="record")
         self._panel_note("action", "录制中…请在手机上完成一次「下一题」动作", "info")
         self._set_recording(
             True,
@@ -1285,11 +1294,12 @@ class UiBridge:
             self._set_recording(False)
         if result is None:
             return
-        if result.error:
-            self._panel_note("action", f"录制失败：{result.error}", "err")
-            self._log(f"录制失败：{result.error}", "err")
-            self._toast(f"录制失败：{result.error[:80]}", "err")
-            self._update("action", note=result.error)
+        if result.error or not result.steps:
+            message = result.error or "没有录到有效的触摸动作，请重试"
+            self._panel_note("action", f"录制失败：{message}", "err")
+            self._log(f"录制失败：{message}", "err")
+            self._toast(f"录制失败：{message[:80]}", "err")
+            self._update("action", note=message)
             return
         payload_steps = steps_to_payload(result.steps)
         summary = steps_summary(result.steps)
@@ -1298,6 +1308,12 @@ class UiBridge:
         self._update(
             "action", steps=payload_steps, summary=summary, reference=reference, note=note
         )
+        # 录完立刻更新内存配置和面板状态：即使主界面还没把回填值送回来，
+        # 「试一次」也能拿到刚录好的动作（_action_form_patch 会带上 next_action）。
+        self._config.next_action = payload_steps
+        panel = dict(self._panel_state.get("action") or {})
+        panel["steps"] = payload_steps
+        self._panel_state["action"] = panel
         patch: dict[str, Any] = {"next_action": json.dumps(payload_steps, ensure_ascii=False)}
         if reference:
             patch["swipe_reference"] = reference
@@ -1316,22 +1332,35 @@ class UiBridge:
     def test_action(self, payload: Mapping[str, Any] | None) -> dict[str, Any]:
         """按当前动作试一次，并对比前后截图。"""
         try:
-            config = config_from_payload(payload)
+            # 试一次只动手机、不写盘：还没选输出文件夹时也应该能验证翻页动作
+            config = config_from_payload(payload, require_output=False)
         except ConfigError as exc:
             self._toast(str(exc), "err")
             return {"ok": False, "error": str(exc)}
         if self._state["recording"]:
             self._toast("正在录制，请先停止录制", "err")
             return {"ok": False, "error": "正在录制"}
-        steps = normalize_steps(config.next_action)
-        if not steps:
-            self._toast("请先录制翻页动作，或填写手动点按/滑动坐标", "err")
-            return {"ok": False, "error": "没有翻页动作"}
+        # 按「用哪一种」分别校验：点按要有坐标、录制要有步骤；滑动有默认坐标兜底。
+        # （之前只检查 next_action，选了点按/滑动也会误报「请先录制翻页动作」。）
+        kind = str(getattr(config, "page_action", "auto") or "auto").strip().lower()
+        if kind == "record" and not normalize_steps(config.next_action):
+            self._toast("请先录制翻页动作（点「开始录制」，在手机上做一次「下一题」）", "err")
+            return {"ok": False, "error": "没有录制的翻页动作"}
+        if kind == "tap" and not (
+            int(getattr(config, "tap_x", 0) or 0) > 0 and int(getattr(config, "tap_y", 0) or 0) > 0
+        ):
+            self._toast("请先填写点按坐标 X / Y（屏幕像素）", "err")
+            return {"ok": False, "error": "缺少点按坐标"}
+        running_test = self._action_test_thread
+        if running_test is not None and running_test.is_alive():
+            self._toast("上一次「试一次」还在进行，请稍等结果出来", "err")
+            return {"ok": False, "error": "试动作正在进行"}
         self._panel_note("action", "正在试一次翻页动作（对比前后截图）…", "info")
         self._log("正在试一次翻页动作（对比前后截图）…")
-        threading.Thread(
+        self._action_test_thread = threading.Thread(
             target=self._do_test_action, args=(config,), name="drpilot-test-action", daemon=True
-        ).start()
+        )
+        self._action_test_thread.start()
         return {"ok": True}
 
     def _do_test_action(self, config: AppConfig) -> None:
@@ -1879,7 +1908,9 @@ class UiBridge:
                 "retry_wait": float(swipe.get("retry_wait", config.retry_wait) or 0),
             },
             "reference": reference,
-            "steps": action.get("steps") or steps_to_payload(normalize_steps(config.next_action)),
+            # 以界面状态为准；_sync_action_from_config() 启动时已把配置里的录制动作读进来。
+            # 不要在为空时回退到 config.next_action：否则「清除录制」会被旧配置复活。
+            "steps": action.get("steps") or [],
             "summary": str(action.get("summary") or ""),
             "note": str(action.get("note") or NOT_SET_ACTION_NOTE),
         }
@@ -1900,7 +1931,7 @@ class UiBridge:
         """窗口里的值 -> 主界面表单字段（_patch_form 用）。"""
         tap = values.get("tap") or {}
         swipe = values.get("swipe") or {}
-        return {
+        patch = {
             "page_action": self._action_kind(values),
             "action_tap_x": int(tap.get("x") or 0),
             "action_tap_y": int(tap.get("y") or 0),
@@ -1914,6 +1945,11 @@ class UiBridge:
             "swipe_retry_wait": float(swipe.get("retry_wait") or 0),
             "swipe_reference": str(values.get("reference") or ""),
         }
+        # 录制动作直接写回 next_action：这样「试一次」不用等主界面把回填值送回后端。
+        if "steps" in values:
+            steps = values.get("steps") or []
+            patch["next_action"] = json.dumps(steps, ensure_ascii=False) if steps else ""
+        return patch
 
     def action_summary(self) -> str:
         """主界面入口卡片上那行摘要。"""
@@ -1935,6 +1971,8 @@ class UiBridge:
             running = bool(self._state.get("running"))
             recording = bool(self._state.get("recording"))
         kind = self._action_kind(values)
+        test_thread = self._action_test_thread
+        testing = bool(test_thread is not None and test_thread.is_alive())
         return {
             "ok": True,
             "kind": kind,
@@ -1949,6 +1987,7 @@ class UiBridge:
             "reference": values.get("reference") or "",
             "recording": recording,
             "running": running,
+            "testing": testing,
             "notice": self._panel_notice("action"),
         }
 
@@ -1964,6 +2003,9 @@ class UiBridge:
             "tap": {**current["tap"], **dict(data.get("tap") or {})},
             "swipe": {**current["swipe"], **dict(data.get("swipe") or {})},
             "reference": data.get("reference", current.get("reference") or ""),
+            # 录制的步骤不能因为切到点按/滑动就被丢掉：保存时原样带着走，
+            # _action_form_patch 会把它写回 next_action（否则「试一次」还得等主界面回填）。
+            "steps": current.get("steps") or [],
         }
         if kind == "tap":
             tap = merged["tap"]
@@ -1996,6 +2038,9 @@ class UiBridge:
         panel = dict(self._panel_state.get("action") or {})
         panel["steps"] = []
         self._panel_state["action"] = panel
+        # 内存配置也要一起清：否则状态里「已清除」，_config_dict() 里还留着旧动作，
+        # 下一次 panel_payload 又会把它带回来。
+        self._config.next_action = []
         self._patch_form(next_action="")
         self._update("action", steps=[], summary="", note="已清除录制的动作")
         self._log("已清除录制的翻页动作")

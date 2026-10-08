@@ -343,10 +343,15 @@ async function run() {
   if (recordChoice) recordChoice.click();
   await sleep(200);
   window.__recordCard = visible("card-record") && !visible("card-tap") && !visible("card-swipe");
-  click("btn-record-start");
-  await sleep(300);
-  click("btn-record-stop");
+  // 录制按钮是「开始录制 ⇄ 结束录制」一个按钮切换
+  const recordToggle = document.getElementById("btn-record-toggle");
+  window.__recordLabelStart = recordToggle ? recordToggle.textContent.trim() : "";
+  click("btn-record-toggle");
+  await sleep(400);
+  window.__recordLabelDuring = ((document.getElementById("btn-record-toggle") || {}).textContent || "").trim();
+  click("btn-record-toggle");
   await sleep(500);
+  window.__recordLabelEnd = ((document.getElementById("btn-record-toggle") || {}).textContent || "").trim();
   window.__steps = document.querySelectorAll("#action-steps li").length;
   click("btn-record-clear");
   await sleep(400);
@@ -368,6 +373,9 @@ setTimeout(function () {
       "\nAPPLIED=" + JSON.stringify(window.__applied) +
       "\nREF_FROM_DEVICE=" + String(window.__refFromDevice) +
       "\nTEST_OK=" + String(window.__testOk) +
+      "\nRECORD_LABEL_START=" + String(window.__recordLabelStart) +
+      "\nRECORD_LABEL_DURING=" + String(window.__recordLabelDuring) +
+      "\nRECORD_LABEL_END=" + String(window.__recordLabelEnd) +
       "\nSTEPS=" + String(window.__steps) +
       "\nSTEPS_CLEARED=" + String(window.__stepsCleared);
     document.body.appendChild(pre);
@@ -858,6 +866,9 @@ PAGES: list[dict] = [
             ("SWIPE_OK", "true", None, "滑动参数 / 基准分辨率没有发出去"),
             ("REF_FROM_DEVICE", "true", None, "「设为当前设备」读回的基准分辨率没有显示出来"),
             ("TEST_OK", "true", None, "「试一次」没有带上当前选择"),
+            ("RECORD_LABEL_START", "eq", "开始录制", "未录制时按钮不是「开始录制」"),
+            ("RECORD_LABEL_DURING", "eq", "结束录制", "开始录制后按钮没有切换成「结束录制」"),
+            ("RECORD_LABEL_END", "eq", "开始录制", "结束录制后按钮没有切回「开始录制」"),
             ("STEPS", "min", 1, "录制完成后没有渲染步骤列表"),
             ("STEPS_CLEARED", "true", None, "清除录制后步骤列表没有清空"),
         ],

@@ -485,6 +485,15 @@ class BridgeActionTests(unittest.TestCase):
         self.assertIn("next_action", patch)
         self.assertEqual(patch["swipe_reference"], "1260x2720")
 
+    def test_start_record_selects_record_kind(self):
+        with mock.patch("drpilot.webui.bridge.record_once", return_value=self._result()):
+            self.bridge.start_record(make_payload(page_action="swipe"))
+            self.assertTrue(wait_until(lambda: bool(self.bridge._state["action"]["steps"])))
+        self.assertEqual(self.bridge.action_state()["kind"], "record")
+        self.assertEqual(self.bridge._config.page_action, "record")
+        patch = self.bridge.poll()["state"]["form_patch"]
+        self.assertEqual(patch.get("page_action"), "record")
+
     def test_record_failure_reports_note(self):
         result = RecordResult(error="没有录到触摸事件，请重试")
         with mock.patch("drpilot.webui.bridge.record_once", return_value=result):
@@ -545,9 +554,80 @@ class BridgeActionTests(unittest.TestCase):
         self.assertEqual(state["reference"], "1080x2340")
         self.assertIn("已加载", state["note"])
 
-    def test_test_action_without_steps(self):
-        result = self.bridge.test_action(make_payload(next_action=""))
+    def test_test_action_record_without_steps_is_rejected(self):
+        result = self.bridge.test_action(make_payload(next_action="", page_action="record"))
         self.assertFalse(result["ok"])
+        self.assertIn("录制", result["error"])
+
+    def test_test_action_tap_accepts_coordinates(self):
+        with mock.patch.object(self.bridge, "_do_test_action") as runner:
+            result = self.bridge.test_action(
+                make_payload(page_action="tap", action_tap_x="540", action_tap_y="2280")
+            )
+            self.assertTrue(wait_until(lambda: runner.called))
+        self.assertTrue(result["ok"])
+
+    def test_test_action_tap_without_coordinates_is_rejected(self):
+        result = self.bridge.test_action(
+            make_payload(page_action="tap", action_tap_x="", action_tap_y="")
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("坐标", result["error"])
+
+    def test_test_action_swipe_uses_default_coordinates(self):
+        with mock.patch.object(self.bridge, "_do_test_action") as runner:
+            result = self.bridge.test_action(make_payload(page_action="swipe"))
+            self.assertTrue(wait_until(lambda: runner.called))
+        self.assertTrue(result["ok"])
+
+    def test_test_action_rejects_overlapping_run(self):
+        release = threading.Event()
+
+        def blocking(config):
+            release.wait(timeout=5)
+
+        with mock.patch.object(self.bridge, "_do_test_action", side_effect=blocking):
+            self.assertTrue(self.bridge.test_action(make_payload(page_action="swipe"))["ok"])
+            self.assertTrue(
+                wait_until(
+                    lambda: self.bridge._action_test_thread is not None
+                    and self.bridge._action_test_thread.is_alive()
+                )
+            )
+            second = self.bridge.test_action(make_payload(page_action="swipe"))
+            self.assertFalse(second["ok"])
+            self.assertTrue(self.bridge.action_state()["testing"])
+            release.set()
+
+    def test_recorded_action_can_be_tested_without_form_roundtrip(self):
+        """录完立刻点「试一次」也要能拿到动作，不能依赖主界面把回填值送回来。"""
+        with mock.patch("drpilot.webui.bridge.record_once", return_value=self._result()):
+            self.bridge.start_record(make_payload())
+            self.assertTrue(wait_until(lambda: bool(self.bridge._state["action"]["steps"])))
+        with mock.patch.object(self.bridge, "_do_test_action") as runner:
+            result = self.bridge.test_panel_action({"kind": "record", "reference": "1260x2720"})
+            self.assertTrue(wait_until(lambda: runner.called))
+        self.assertTrue(result["ok"])
+
+    def test_save_action_settings_keeps_recorded_steps(self):
+        self.bridge._update(
+            "action", steps=[{"kind": "tap", "x": 1, "y": 2, "duration_ms": 0}]
+        )
+        result = self.bridge.save_action_settings({"kind": "tap", "tap": {"x": 5, "y": 6}})
+        self.assertTrue(result["ok"])
+        patch = self.bridge.poll()["state"]["form_patch"]
+        self.assertEqual(
+            json.loads(patch["next_action"]),
+            [{"kind": "tap", "x": 1, "y": 2, "duration_ms": 0}],
+        )
+
+    def test_clear_recorded_does_not_resurrect_config_action(self):
+        action = [{"kind": "tap", "x": 9, "y": 9, "duration_ms": 0}]
+        self.bridge._config.next_action = action
+        self.bridge._update("action", steps=list(action))
+        self.bridge.clear_recorded()
+        self.assertEqual(self.bridge.action_state()["record"]["steps"], [])
+        self.assertEqual(self.bridge._config.next_action, [])
 
 
 class GuiEntryTests(unittest.TestCase):
