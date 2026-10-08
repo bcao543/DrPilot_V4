@@ -281,3 +281,20 @@ uv run python tools/ui_selftest.py
 > 仓库**不含** `.env`、`drpilot_config.json`、`logs/`、`.venv/`：克隆下来是干净源码，
 > 密钥与本地配置由你自己生成，且都已在 `.gitignore` 里。
 > 一个仓库只留一个 `.venv`，且只属于一边（Windows 或 WSL）——细节见 [AGENTS.md](AGENTS.md)。
+
+## 支持开发（打赏）
+
+朋友，刷题软件里的题，复制费劲、导出没门、排版还乱？这工具一跑，题目乖乖出来。
+
+GitHub 已开源，收款码就在下面。用着顺手，点个 Star；帮你省了时间，扫个码。五块不嫌少，五十不嫌多。
+
+不是订阅，不是套路，就是请开发者喝杯咖啡，然后继续把工具磨快。别让写代码的人用爱发电，发到跳闸。
+
+**Better Call the Dev。**
+
+<p align="center">
+  <img src="docs/sponsor/alipay.jpg" alt="支付宝收款码" width="300">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/sponsor/wechat.png" alt="微信收款码" width="300">
+</p>
+
